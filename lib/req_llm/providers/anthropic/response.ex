@@ -36,6 +36,16 @@ defmodule ReqLLM.Providers.Anthropic.Response do
 
   alias ReqLLM.Message.ReasoningDetails
 
+  # Content blocks produced by Anthropic server tools. `server_tool_use` is
+  # listed separately where streaming is concerned: its `input` arrives via
+  # input_json_delta fragments, while result blocks arrive complete.
+  @server_tool_result_types [
+    "web_search_tool_result",
+    "web_fetch_tool_result",
+    "code_execution_tool_result"
+  ]
+  @server_tool_block_types ["server_tool_use" | @server_tool_result_types]
+
   @doc """
   Decode Anthropic response data to ReqLLM.Response.
   """
@@ -63,7 +73,9 @@ defmodule ReqLLM.Providers.Anthropic.Response do
       stream: nil,
       usage: usage,
       finish_reason: finish_reason,
-      provider_meta: Map.drop(data, ["id", "model", "content", "usage", "stop_reason"])
+      # stop_reason is kept: callers need the raw value for provider-specific
+      # reasons that normalize lossily (e.g. "pause_turn").
+      provider_meta: Map.drop(data, ["id", "model", "content", "usage"])
     }
 
     {:ok, response}
@@ -100,18 +112,20 @@ defmodule ReqLLM.Providers.Anthropic.Response do
         [ReqLLM.StreamChunk.meta(%{terminal?: true})]
 
       %{"type" => "message_delta", "delta" => delta} ->
-        finish_reason =
-          case Map.get(delta, "stop_reason") do
-            "end_turn" -> :stop
-            "max_tokens" -> :length
-            "stop_sequence" -> :stop
-            "tool_use" -> :tool_calls
-            _ -> :unknown
-          end
+        stop_reason = Map.get(delta, "stop_reason")
+        finish_reason = parse_stream_finish_reason(stop_reason)
 
         raw_usage = Map.get(data, "usage", %{})
 
-        chunks = [ReqLLM.StreamChunk.meta(%{finish_reason: finish_reason, terminal?: true})]
+        # The raw stop_reason rides along because normalization is lossy —
+        # e.g. :incomplete covers both "pause_turn" (resumable) and "refusal".
+        chunks = [
+          ReqLLM.StreamChunk.meta(%{
+            finish_reason: finish_reason,
+            stop_reason: stop_reason,
+            terminal?: true
+          })
+        ]
 
         # Add usage chunk if present
         if raw_usage == %{} do
@@ -153,7 +167,7 @@ defmodule ReqLLM.Providers.Anthropic.Response do
         decode_content_block_start(block, index, state)
 
       %{"type" => "content_block_stop", "index" => index} ->
-        finalize_thinking_block(index, state)
+        finalize_content_block(index, state)
 
       %{"type" => "message_stop"} ->
         {[ReqLLM.StreamChunk.meta(%{terminal?: true})], state}
@@ -212,6 +226,13 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     ReqLLM.StreamChunk.tool_call(name, input, %{id: id})
   end
 
+  # Server-tool blocks (tools executed by the API itself) are carried verbatim
+  # so they can be re-sent on the next request — required for pause_turn
+  # continuations and for multi-turn reuse of results (encrypted_content).
+  defp decode_content_block(%{"type" => type} = block) when type in @server_tool_block_types do
+    server_block_chunk(block)
+  end
+
   defp decode_content_block(_), do: nil
 
   defp decode_content_block_delta(%{"type" => "text_delta", "text" => text}, _index)
@@ -261,6 +282,22 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     {[], update_thinking_signature(state, index, signature)}
   end
 
+  # An input_json_delta for a pending server_tool_use is absorbed into stream
+  # state (joined at content_block_stop) rather than emitted as an orphaned
+  # tool_call_args fragment the accumulator would warn about and drop.
+  defp decode_content_block_delta(
+         %{"type" => "input_json_delta", "partial_json" => fragment} = delta,
+         index,
+         state
+       )
+       when is_binary(fragment) do
+    if server_block_pending?(state, index) do
+      {[], append_server_block_fragment(state, index, fragment)}
+    else
+      {decode_content_block_delta(delta, index), state}
+    end
+  end
+
   defp decode_content_block_delta(delta, index, state) do
     {decode_content_block_delta(delta, index), state}
   end
@@ -293,6 +330,18 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     {chunks, start_thinking_block(state, index, block)}
   end
 
+  # A server_tool_use block streams its input as input_json_delta fragments;
+  # stash the skeleton and emit the completed block at content_block_stop.
+  defp decode_content_block_start(%{"type" => "server_tool_use"} = block, index, state) do
+    {[], put_server_block(state, index, block)}
+  end
+
+  # Server-tool result blocks arrive complete in content_block_start.
+  defp decode_content_block_start(%{"type" => type} = block, _index, state)
+       when type in @server_tool_result_types do
+    {[server_block_chunk(block)], state}
+  end
+
   defp decode_content_block_start(block, index, state) do
     {decode_content_block_start(block, index), state}
   end
@@ -300,9 +349,11 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   defp build_message_from_chunks([]), do: nil
 
   defp build_message_from_chunks(chunks) do
+    # A single ordered pass so provider blocks keep their position relative to
+    # text (a server_tool_use precedes its result, which precedes the text that
+    # cites it); chunk_to_content_part returns nil for non-part chunks.
     content_parts =
       chunks
-      |> Enum.filter(&(&1.type in [:content, :thinking]))
       |> Enum.map(&chunk_to_content_part/1)
       |> Enum.reject(&is_nil/1)
 
@@ -350,6 +401,13 @@ defmodule ReqLLM.Providers.Anthropic.Response do
 
   defp chunk_to_content_part(%ReqLLM.StreamChunk{type: :thinking, text: text}) do
     %ReqLLM.Message.ContentPart{type: :thinking, text: text}
+  end
+
+  defp chunk_to_content_part(%ReqLLM.StreamChunk{
+         type: :meta,
+         metadata: %{provider_block: block}
+       }) do
+    ReqLLM.Message.ContentPart.provider_block(block, :anthropic)
   end
 
   defp chunk_to_content_part(_), do: nil
@@ -424,8 +482,81 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   defp parse_finish_reason("tool_use"), do: :tool_calls
   defp parse_finish_reason("end_turn"), do: :stop
   defp parse_finish_reason("content_filter"), do: :content_filter
+  # The turn is paused mid-execution (long-running server tools); callers
+  # resume it by re-sending the conversation with the paused assistant
+  # content appended. The raw stop_reason is preserved alongside.
+  defp parse_finish_reason("pause_turn"), do: :incomplete
   defp parse_finish_reason(reason) when is_binary(reason), do: :error
   defp parse_finish_reason(_), do: nil
+
+  # Streaming variant: preserves the historical mapping (stop_sequence → :stop,
+  # unknown → :unknown rather than :error).
+  defp parse_stream_finish_reason("end_turn"), do: :stop
+  defp parse_stream_finish_reason("stop_sequence"), do: :stop
+  defp parse_stream_finish_reason("max_tokens"), do: :length
+  defp parse_stream_finish_reason("tool_use"), do: :tool_calls
+  defp parse_stream_finish_reason("pause_turn"), do: :incomplete
+  defp parse_stream_finish_reason(_), do: :unknown
+
+  defp server_block_chunk(block) do
+    ReqLLM.StreamChunk.meta(%{provider_block: block, provider: :anthropic})
+  end
+
+  # A content_block_stop closes whichever kind of stateful block is pending at
+  # that index: a buffered server_tool_use emits its completed block; anything
+  # else falls through to thinking finalization.
+  defp finalize_content_block(index, state) do
+    case pop_server_block(state, index) do
+      {nil, state} -> finalize_thinking_block(index, state)
+      {block, state} -> {[server_block_chunk(block)], state}
+    end
+  end
+
+  defp put_server_block(state, index, block) do
+    blocks = Map.get(state, :server_blocks, %{})
+    entry = %{block: block, fragments: []}
+    Map.put(state, :server_blocks, Map.put(blocks, index, entry))
+  end
+
+  defp server_block_pending?(state, index) do
+    state |> Map.get(:server_blocks, %{}) |> Map.has_key?(index)
+  end
+
+  defp append_server_block_fragment(state, index, fragment) do
+    blocks = Map.get(state, :server_blocks, %{})
+
+    case blocks[index] do
+      nil ->
+        state
+
+      entry ->
+        entry = %{entry | fragments: [fragment | entry.fragments]}
+        Map.put(state, :server_blocks, Map.put(blocks, index, entry))
+    end
+  end
+
+  defp pop_server_block(state, index) do
+    blocks = Map.get(state, :server_blocks, %{})
+
+    case Map.pop(blocks, index) do
+      {nil, _} ->
+        {nil, state}
+
+      {%{block: block, fragments: fragments}, rest} ->
+        {finalize_server_block_input(block, fragments), Map.put(state, :server_blocks, rest)}
+    end
+  end
+
+  defp finalize_server_block_input(block, []), do: block
+
+  defp finalize_server_block_input(block, fragments) do
+    json = fragments |> Enum.reverse() |> IO.iodata_to_binary()
+
+    case Jason.decode(json) do
+      {:ok, input} -> Map.put(block, "input", input)
+      {:error, _} -> block
+    end
+  end
 
   defp ensure_stream_state(nil), do: init_stream_state()
   defp ensure_stream_state(state), do: state
@@ -442,17 +573,21 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   end
 
   defp message_delta_chunks(data, delta) do
-    finish_reason =
-      case Map.get(delta, "stop_reason") do
-        "end_turn" -> :stop
-        "max_tokens" -> :length
-        "stop_sequence" -> :stop
-        "tool_use" -> :tool_calls
-        _ -> :unknown
-      end
+    stop_reason = Map.get(delta, "stop_reason")
+    finish_reason = parse_stream_finish_reason(stop_reason)
 
     raw_usage = Map.get(data, "usage", %{})
-    chunks = [ReqLLM.StreamChunk.meta(%{finish_reason: finish_reason, terminal?: true})]
+
+    # The raw stop_reason rides along because normalization is lossy —
+    # e.g. :incomplete covers "pause_turn", which callers resume by
+    # re-sending the conversation with the paused assistant content.
+    chunks = [
+      ReqLLM.StreamChunk.meta(%{
+        finish_reason: finish_reason,
+        stop_reason: stop_reason,
+        terminal?: true
+      })
+    ]
 
     if raw_usage == %{} do
       chunks
