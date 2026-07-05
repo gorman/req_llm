@@ -68,15 +68,23 @@ defmodule ReqLLM.Provider.Defaults.ResponseBuilder do
     text_content = ChunkAccumulator.finalize_text(acc)
     thinking_content = ChunkAccumulator.finalize_thinking(acc)
 
+    # Provider-native blocks (e.g. Anthropic server-tool blocks) precede the
+    # text: a server tool runs before the text that cites its results.
+    provider_block_parts =
+      acc
+      |> ChunkAccumulator.finalize_provider_blocks()
+      |> Enum.map(fn {provider, block} -> ContentPart.provider_block(block, provider) end)
+
     content_parts =
-      materialize_content_parts(
-        profile,
-        chunks,
-        acc,
-        text_content,
-        thinking_content,
-        normalized_tool_calls
-      )
+      provider_block_parts ++
+        materialize_content_parts(
+          profile,
+          chunks,
+          acc,
+          text_content,
+          thinking_content,
+          normalized_tool_calls
+        )
 
     reasoning_details = materialize_reasoning_details(profile, chunks, acc, model.provider)
 
@@ -97,6 +105,14 @@ defmodule ReqLLM.Provider.Defaults.ResponseBuilder do
       base_provider_meta
       |> put_streamed_logprobs(ChunkAccumulator.finalize_logprobs(acc))
       |> put_streamed_annotations(ChunkAccumulator.finalize_annotations(acc))
+
+    # Keep the raw stop reason next to the normalized finish_reason, matching
+    # the non-streaming decoders — normalization is lossy (e.g. "pause_turn").
+    provider_meta =
+      case ChunkAccumulator.finalize_stop_reason(acc) do
+        nil -> provider_meta
+        stop_reason -> Map.put_new(provider_meta, "stop_reason", stop_reason)
+      end
 
     base_response = %Response{
       id: materialize_response_id(profile, metadata),
