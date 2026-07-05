@@ -155,7 +155,11 @@ defmodule ReqLLM.Providers.AnthropicServerToolsTest do
           {acc ++ event_chunks, next_state}
         end)
 
-      assert [%ReqLLM.StreamChunk{type: :meta, metadata: %{provider_block: block}}] = chunks
+      assert [
+               %ReqLLM.StreamChunk{type: :meta, metadata: %{server_tool_started: "web_search"}},
+               %ReqLLM.StreamChunk{type: :meta, metadata: %{provider_block: block}}
+             ] = chunks
+
       assert block["type"] == "server_tool_use"
       assert block["input"] == %{"query" => "example"}
     end
@@ -224,7 +228,10 @@ defmodule ReqLLM.Providers.AnthropicServerToolsTest do
       {:ok, response} =
         ReqLLM.Provider.Defaults.ResponseBuilder.build_response(
           chunks,
-          %{finish_reason: :incomplete}, context: %ReqLLM.Context{messages: []}, model: model())
+          %{finish_reason: :incomplete},
+          context: %ReqLLM.Context{messages: []},
+          model: model()
+        )
 
       assert [
                %ContentPart{type: :provider_block, data: %{"type" => "server_tool_use"}},
