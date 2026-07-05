@@ -55,8 +55,14 @@ defmodule ReqLLM.Providers.AnthropicServerToolsTest do
         Anthropic.Response.decode_response(server_tool_response_data("end_turn"), model())
 
       assert [
-               %ContentPart{type: :provider_block, data: %{"type" => "server_tool_use"} = use_block},
-               %ContentPart{type: :provider_block, data: %{"type" => "web_search_tool_result"} = result_block},
+               %ContentPart{
+                 type: :provider_block,
+                 data: %{"type" => "server_tool_use"} = use_block
+               },
+               %ContentPart{
+                 type: :provider_block,
+                 data: %{"type" => "web_search_tool_result"} = result_block
+               },
                %ContentPart{type: :text, text: "Here is what I found."}
              ] = response.message.content
 
@@ -144,8 +150,7 @@ defmodule ReqLLM.Providers.AnthropicServerToolsTest do
       ]
 
       {chunks, _state} =
-        Enum.reduce(events, {[], Anthropic.init_stream_state(model())}, fn event,
-                                                                           {acc, state} ->
+        Enum.reduce(events, {[], Anthropic.init_stream_state(model())}, fn event, {acc, state} ->
           {event_chunks, next_state} = Anthropic.decode_stream_event(event, model(), state)
           {acc ++ event_chunks, next_state}
         end)
@@ -194,6 +199,40 @@ defmodule ReqLLM.Providers.AnthropicServerToolsTest do
                  &1
                )
              )
+    end
+  end
+
+  describe "streamed response materialization (ResponseBuilder)" do
+    test "provider blocks and the raw stop_reason survive into the built response" do
+      chunks = [
+        ReqLLM.StreamChunk.meta(%{
+          provider_block: %{"type" => "server_tool_use", "id" => "srvtoolu_1"},
+          provider: :anthropic
+        }),
+        ReqLLM.StreamChunk.meta(%{
+          provider_block: %{"type" => "web_search_tool_result", "tool_use_id" => "srvtoolu_1"},
+          provider: :anthropic
+        }),
+        ReqLLM.StreamChunk.text("Found it."),
+        ReqLLM.StreamChunk.meta(%{
+          finish_reason: :incomplete,
+          stop_reason: "pause_turn",
+          terminal?: true
+        })
+      ]
+
+      {:ok, response} =
+        ReqLLM.Provider.Defaults.ResponseBuilder.build_response(
+          chunks,
+          %{finish_reason: :incomplete}, context: %ReqLLM.Context{messages: []}, model: model())
+
+      assert [
+               %ContentPart{type: :provider_block, data: %{"type" => "server_tool_use"}},
+               %ContentPart{type: :provider_block, data: %{"type" => "web_search_tool_result"}},
+               %ContentPart{type: :text, text: "Found it."}
+             ] = response.message.content
+
+      assert response.provider_meta["stop_reason"] == "pause_turn"
     end
   end
 
