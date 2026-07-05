@@ -144,6 +144,16 @@ defmodule ReqLLM.Providers.Anthropic do
 
       Example: %{max_uses: 3, allowed_domains: ["example.com"]}
       """
+    ],
+    code_execution: [
+      type: :map,
+      doc: """
+      Enable the code execution server tool (code_execution_20250522): the API
+      runs model-written code in a sandboxed container. Takes no configuration
+      today; pass an empty map to enable. Adds the code-execution beta header.
+
+      Example: %{}
+      """
     ]
   ]
 
@@ -163,6 +173,7 @@ defmodule ReqLLM.Providers.Anthropic do
   @anthropic_beta_tools "tools-2024-05-16"
   @anthropic_beta_prompt_caching "prompt-caching-2024-07-31"
   @anthropic_beta_files_api "files-api-2025-04-14"
+  @anthropic_beta_code_execution "code-execution-2025-05-22"
   @claude_subscription_betas ["oauth-2025-04-20", "interleaved-thinking-2025-05-14"]
   @claude_subscription_user_agent "claude-cli/2.1.112 (external, cli)"
   @claude_subscription_x_app "claude-code"
@@ -925,6 +936,13 @@ defmodule ReqLLM.Providers.Anthropic do
         beta_features
       end
 
+    beta_features =
+      if has_code_execution?(opts) do
+        [@anthropic_beta_code_execution | beta_features]
+      else
+        beta_features
+      end
+
     Enum.uniq(beta_features)
   end
 
@@ -941,11 +959,16 @@ defmodule ReqLLM.Providers.Anthropic do
     tools = Keyword.get(user_opts, :tools, [])
 
     server_tools? =
-      Enum.any?([:web_search, :web_fetch], fn key ->
+      Enum.any?([:web_search, :web_fetch, :code_execution], fn key ->
         is_map(get_option(user_opts, key) || get_option(provider_opts, key))
       end)
 
     (is_list(tools) and tools != []) or server_tools?
+  end
+
+  defp has_code_execution?(user_opts) do
+    provider_opts = Keyword.get(user_opts, :provider_options, [])
+    is_map(get_option(user_opts, :code_execution) || get_option(provider_opts, :code_execution))
   end
 
   defp has_thinking?(user_opts) do
@@ -1199,6 +1222,9 @@ defmodule ReqLLM.Providers.Anthropic do
     web_fetch_config =
       get_option(options, :web_fetch) || get_option(provider_opts, :web_fetch)
 
+    code_execution_config =
+      get_option(options, :code_execution) || get_option(provider_opts, :code_execution)
+
     # Build the tools list
     formatted_tools =
       if is_list(tools) and tools != [],
@@ -1208,7 +1234,8 @@ defmodule ReqLLM.Providers.Anthropic do
     server_tools =
       [
         if(is_map(web_search_config), do: build_web_search_tool(web_search_config)),
-        if(is_map(web_fetch_config), do: build_web_fetch_tool(web_fetch_config))
+        if(is_map(web_fetch_config), do: build_web_fetch_tool(web_fetch_config)),
+        if(is_map(code_execution_config), do: build_code_execution_tool())
       ]
       |> Enum.reject(&is_nil/1)
 
@@ -1338,6 +1365,11 @@ defmodule ReqLLM.Providers.Anthropic do
       get_server_tool_opt(config, :max_content_tokens)
     )
     |> maybe_put_server_tool_opt(:citations, get_server_tool_opt(config, :citations))
+  end
+
+  # Builds the code execution tool definition; the tool takes no configuration.
+  defp build_code_execution_tool do
+    %{type: "code_execution_20250522", name: "code_execution"}
   end
 
   defp get_server_tool_opt(config, key) do

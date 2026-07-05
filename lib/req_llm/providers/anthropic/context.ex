@@ -258,6 +258,18 @@ defmodule ReqLLM.Providers.Anthropic.Context do
     %{type: "text", text: text}
   end
 
+  # A provider-native block decoded from an earlier Anthropic response
+  # (server_tool_use, web_search_tool_result, …) is re-sent verbatim — the
+  # provider guard keeps another provider's blocks out of an Anthropic request.
+  defp do_encode_content_part(%ReqLLM.Message.ContentPart{
+         type: :provider_block,
+         data: block,
+         metadata: %{provider: :anthropic}
+       })
+       when is_map(block) do
+    block
+  end
+
   defp do_encode_content_part(%ReqLLM.Message.ContentPart{
          type: :thinking,
          metadata: %{"redacted" => true, "data" => data}

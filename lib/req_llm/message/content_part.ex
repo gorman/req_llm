@@ -19,7 +19,8 @@ defmodule ReqLLM.Message.ContentPart do
   """
 
   @schema Zoi.struct(__MODULE__, %{
-            type: Zoi.enum([:text, :image_url, :video_url, :image, :file, :thinking]),
+            type:
+              Zoi.enum([:text, :image_url, :video_url, :image, :file, :thinking, :provider_block]),
             text: Zoi.string() |> Zoi.nullable() |> Zoi.default(nil),
             url: Zoi.string() |> Zoi.nullable() |> Zoi.default(nil),
             data: Zoi.any() |> Zoi.nullable() |> Zoi.default(nil),
@@ -53,6 +54,18 @@ defmodule ReqLLM.Message.ContentPart do
   @spec thinking(String.t(), map()) :: t()
   def thinking(content, metadata),
     do: %__MODULE__{type: :thinking, text: content, metadata: metadata}
+
+  @doc """
+  A provider-native content block carried verbatim: `data` holds the raw block
+  map exactly as the provider returned it. Used for block types that have no
+  cross-provider representation (e.g. Anthropic server-tool blocks such as
+  `server_tool_use` and `web_search_tool_result`), so they survive the
+  decode → context → encode round-trip. Providers must only re-encode blocks
+  whose `metadata.provider` matches their own.
+  """
+  @spec provider_block(map(), atom()) :: t()
+  def provider_block(block, provider) when is_map(block) and is_atom(provider),
+    do: %__MODULE__{type: :provider_block, data: block, metadata: %{provider: provider}}
 
   @spec image_url(String.t()) :: t()
   def image_url(url), do: %__MODULE__{type: :image_url, url: url}

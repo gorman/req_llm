@@ -92,7 +92,8 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
           logprobs: [term()],
           annotations: [term()],
           finish_reason: atom() | String.t() | nil,
-          usage: map() | nil
+          usage: map() | nil,
+          provider_blocks: [{atom(), map()}]
         }
 
   defstruct text_content: [],
@@ -105,7 +106,8 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
             logprobs: [],
             annotations: [],
             finish_reason: nil,
-            usage: nil
+            usage: nil,
+            provider_blocks: []
 
   @doc "Returns an empty accumulator."
   @spec new() :: t()
@@ -189,6 +191,7 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
     |> push_annotations(metadata)
     |> push_finish_reason(metadata)
     |> push_usage(metadata)
+    |> push_provider_block(metadata)
   end
 
   def push(%__MODULE__{} = acc, _chunk), do: acc
@@ -220,6 +223,13 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
   end
 
   # Stored reversed (newest first) — finalizers reverse to restore order.
+  defp push_provider_block(acc, %{provider_block: block} = metadata) when is_map(block) do
+    provider = Map.get(metadata, :provider, :unknown)
+    %{acc | provider_blocks: [{provider, block} | acc.provider_blocks]}
+  end
+
+  defp push_provider_block(acc, _metadata), do: acc
+
   defp push_reasoning_details(acc, %{reasoning_details: details}) when is_list(details) do
     %{acc | reasoning_details: Enum.reverse(details, acc.reasoning_details)}
   end
@@ -486,7 +496,18 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
   @spec finalize_message(t()) :: Message.t() | nil
   def finalize_message(%__MODULE__{} = acc) do
     tool_calls = finalize_message_tool_calls(acc)
-    content_parts = finalize_ordered_content(acc, include_thinking?: false)
+    ordered_parts = finalize_ordered_content(acc, include_thinking?: false)
+
+    provider_block_parts =
+      acc.provider_blocks
+      |> Enum.reverse()
+      |> Enum.map(fn {provider, block} -> ContentPart.provider_block(block, provider) end)
+
+    # Provider blocks precede the rest: a server tool runs before the text that
+    # cites its results. Upstream's `content_events` already carries a
+    # `{:content_part, _}` variant, so these belong in that ordered list rather
+    # than concatenated here — moving them is a follow-up, not a rebase fix.
+    content_parts = provider_block_parts ++ ordered_parts
 
     if content_parts == [] and tool_calls == [] do
       nil
