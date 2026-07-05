@@ -84,7 +84,8 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
           reasoning_details: [term()],
           logprobs: [term()],
           finish_reason: atom() | String.t() | nil,
-          usage: map() | nil
+          usage: map() | nil,
+          provider_blocks: [{atom(), map()}]
         }
 
   defstruct text_content: [],
@@ -94,7 +95,8 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
             reasoning_details: [],
             logprobs: [],
             finish_reason: nil,
-            usage: nil
+            usage: nil,
+            provider_blocks: []
 
   @doc "Returns an empty accumulator."
   @spec new() :: t()
@@ -157,6 +159,7 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
     |> push_logprobs(metadata)
     |> push_finish_reason(metadata)
     |> push_usage(metadata)
+    |> push_provider_block(metadata)
   end
 
   def push(%__MODULE__{} = acc, _chunk), do: acc
@@ -172,6 +175,13 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
   end
 
   # Stored reversed (newest first) — finalizers reverse to restore order.
+  defp push_provider_block(acc, %{provider_block: block} = metadata) when is_map(block) do
+    provider = Map.get(metadata, :provider, :unknown)
+    %{acc | provider_blocks: [{provider, block} | acc.provider_blocks]}
+  end
+
+  defp push_provider_block(acc, _metadata), do: acc
+
   defp push_reasoning_details(acc, %{reasoning_details: details}) when is_list(details) do
     %{acc | reasoning_details: Enum.reverse(details, acc.reasoning_details)}
   end
@@ -371,12 +381,22 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
     text = finalize_text(acc)
     tool_calls = finalize_message_tool_calls(acc)
 
-    content_parts =
+    provider_block_parts =
+      acc.provider_blocks
+      |> Enum.reverse()
+      |> Enum.map(fn {provider, block} -> ContentPart.provider_block(block, provider) end)
+
+    text_parts =
       if text == "" do
         []
       else
         [%ContentPart{type: :text, text: text, metadata: %{}}]
       end
+
+    # Provider blocks precede the text: a server tool runs before the text
+    # that cites its results (streamed text is merged into one part, so the
+    # original interleaving cannot be preserved exactly).
+    content_parts = provider_block_parts ++ text_parts
 
     if content_parts == [] and tool_calls == [] do
       nil
