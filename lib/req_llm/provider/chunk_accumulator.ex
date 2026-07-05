@@ -84,6 +84,7 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
           reasoning_details: [term()],
           logprobs: [term()],
           finish_reason: atom() | String.t() | nil,
+          stop_reason: String.t() | nil,
           usage: map() | nil,
           provider_blocks: [{atom(), map()}]
         }
@@ -95,6 +96,7 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
             reasoning_details: [],
             logprobs: [],
             finish_reason: nil,
+            stop_reason: nil,
             usage: nil,
             provider_blocks: []
 
@@ -158,6 +160,7 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
     |> push_reasoning_details(metadata)
     |> push_logprobs(metadata)
     |> push_finish_reason(metadata)
+    |> push_stop_reason(metadata)
     |> push_usage(metadata)
     |> push_provider_block(metadata)
   end
@@ -202,6 +205,14 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
   end
 
   defp push_finish_reason(acc, _metadata), do: acc
+
+  # The provider's raw stop reason (e.g. Anthropic's "pause_turn"), carried
+  # alongside the normalized finish_reason because normalization is lossy.
+  defp push_stop_reason(acc, %{stop_reason: reason}) when is_binary(reason) do
+    %{acc | stop_reason: reason}
+  end
+
+  defp push_stop_reason(acc, _metadata), do: acc
 
   # Usage is merged via `ReqLLM.Usage.merge/2` — handles cumulative
   # streaming token counters (latest-max wins per field) plus recomputed
@@ -281,6 +292,20 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
   """
   @spec finalize_finish_reason(t()) :: atom() | String.t() | nil
   def finalize_finish_reason(%__MODULE__{finish_reason: reason}), do: reason
+
+  @doc """
+  Returns the provider's raw stop reason from meta chunks, or `nil`. Carried
+  alongside `finalize_finish_reason/1` because normalization is lossy (e.g.
+  Anthropic's "pause_turn" normalizes to `:incomplete`).
+  """
+  @spec finalize_stop_reason(t()) :: String.t() | nil
+  def finalize_stop_reason(%__MODULE__{stop_reason: reason}), do: reason
+
+  @doc """
+  Returns `{provider, raw_block}` provider-native blocks in arrival order.
+  """
+  @spec finalize_provider_blocks(t()) :: [{atom(), map()}]
+  def finalize_provider_blocks(%__MODULE__{provider_blocks: blocks}), do: Enum.reverse(blocks)
 
   @doc """
   Returns the merged usage map (or `nil` if no meta chunk surfaced usage).
