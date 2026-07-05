@@ -327,8 +327,10 @@ defmodule ReqLLM.Providers.Anthropic.Response do
 
   # A server_tool_use block streams its input as input_json_delta fragments;
   # stash the skeleton and emit the completed block at content_block_stop.
+  # The lightweight started chunk goes out immediately so consumers can show
+  # activity while the tool executes server-side.
   defp decode_content_block_start(%{"type" => "server_tool_use"} = block, index, state) do
-    {[], put_server_block(state, index, block)}
+    {[server_tool_started_chunk(block)], put_server_block(state, index, block)}
   end
 
   # Server-tool result blocks arrive complete in content_block_start.
@@ -491,6 +493,11 @@ defmodule ReqLLM.Providers.Anthropic.Response do
 
   defp server_block_chunk(block) do
     ReqLLM.StreamChunk.meta(%{provider_block: block, provider: :anthropic})
+  end
+
+  defp server_tool_started_chunk(block) do
+    name = Map.get(block, "name", "server_tool")
+    ReqLLM.StreamChunk.meta(%{server_tool_started: name, provider: :anthropic})
   end
 
   # A content_block_stop closes whichever kind of stateful block is pending at
