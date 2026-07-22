@@ -148,9 +148,12 @@ defmodule ReqLLM.Providers.Anthropic do
     code_execution: [
       type: :map,
       doc: """
-      Enable the code execution server tool (code_execution_20250522): the API
-      runs model-written code in a sandboxed container. Takes no configuration
-      today; pass an empty map to enable. Adds the code-execution beta header.
+      Enable the code execution server tool (code_execution_20260521): the API
+      runs model-written code in a sandboxed container. This version's tool
+      description tells the model about the 90-second wall-clock limit per
+      Python cell in programmatic tool calling, so it budgets long-running
+      cells. Takes no configuration today; pass an empty map to enable. GA —
+      no beta header required.
 
       Example: %{}
       """
@@ -185,7 +188,6 @@ defmodule ReqLLM.Providers.Anthropic do
   @anthropic_beta_tools "tools-2024-05-16"
   @anthropic_beta_prompt_caching "prompt-caching-2024-07-31"
   @anthropic_beta_files_api "files-api-2025-04-14"
-  @anthropic_beta_code_execution "code-execution-2025-05-22"
   @claude_subscription_betas ["oauth-2025-04-20", "interleaved-thinking-2025-05-14"]
   @claude_subscription_user_agent "claude-cli/2.1.112 (external, cli)"
   @claude_subscription_x_app "claude-code"
@@ -961,13 +963,6 @@ defmodule ReqLLM.Providers.Anthropic do
         beta_features
       end
 
-    beta_features =
-      if has_code_execution?(opts) do
-        [@anthropic_beta_code_execution | beta_features]
-      else
-        beta_features
-      end
-
     Enum.uniq(beta_features)
   end
 
@@ -989,11 +984,6 @@ defmodule ReqLLM.Providers.Anthropic do
       end)
 
     (is_list(tools) and tools != []) or server_tools?
-  end
-
-  defp has_code_execution?(user_opts) do
-    provider_opts = Keyword.get(user_opts, :provider_options, [])
-    is_map(get_option(user_opts, :code_execution) || get_option(provider_opts, :code_execution))
   end
 
   defp has_thinking?(user_opts) do
@@ -1342,7 +1332,7 @@ defmodule ReqLLM.Providers.Anthropic do
   #     * `:user_location` - Map with keys: type, city, region, country, timezone
   defp build_web_search_tool(config) when is_map(config) do
     base_tool = %{
-      type: "web_search_20250305",
+      type: "web_search_20260209",
       name: "web_search"
     }
 
@@ -1394,7 +1384,7 @@ defmodule ReqLLM.Providers.Anthropic do
 
   # Builds the code execution tool definition; the tool takes no configuration.
   defp build_code_execution_tool do
-    %{type: "code_execution_20250522", name: "code_execution"}
+    %{type: "code_execution_20260521", name: "code_execution"}
   end
 
   defp get_server_tool_opt(config, key) do
