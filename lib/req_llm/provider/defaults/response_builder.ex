@@ -114,6 +114,15 @@ defmodule ReqLLM.Provider.Defaults.ResponseBuilder do
         stop_reason -> Map.put_new(provider_meta, "stop_reason", stop_reason)
       end
 
+    # The code-execution container survives alongside stop_reason: resuming a
+    # "pause_turn" with pending code-execution tool uses requires sending the
+    # container id back on the follow-up request.
+    provider_meta =
+      case ChunkAccumulator.finalize_container(acc) do
+        nil -> provider_meta
+        container -> Map.put_new(provider_meta, "container", container)
+      end
+
     base_response = %Response{
       id: materialize_response_id(profile, metadata),
       model: materialize_model(profile, metadata, model),

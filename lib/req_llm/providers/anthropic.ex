@@ -154,6 +154,18 @@ defmodule ReqLLM.Providers.Anthropic do
 
       Example: %{}
       """
+    ],
+    anthropic_container: [
+      type: :string,
+      doc: """
+      Code-execution container id to reuse. REQUIRED when re-sending a
+      conversation whose last assistant message has pending tool uses from
+      code execution (a "pause_turn" cut) — the API rejects the request with
+      "container_id is required" otherwise. The id arrives on the paused
+      response as `provider_meta["container"]["id"]`.
+
+      Example: "container_011CPR8tS8vNy3aDrRwLxo6i"
+      """
     ]
   ]
 
@@ -541,8 +553,21 @@ defmodule ReqLLM.Providers.Anthropic do
     |> maybe_put(:stream, get_option(opts, :stream))
     |> Map.put(:max_tokens, max_tokens)
     |> maybe_add_tools(opts)
+    |> maybe_put_container(opts)
     |> maybe_apply_prompt_caching(opts)
     |> maybe_add_output_format(opts)
+  end
+
+  # A paused code-execution turn can only resume inside its original sandbox,
+  # so the container id from the paused response must ride the follow-up
+  # request as the top-level `container` parameter.
+  defp maybe_put_container(body, opts) do
+    provider_opts = get_option(opts, :provider_options, []) || []
+
+    case get_option(opts, :anthropic_container) || get_option(provider_opts, :container) do
+      id when is_binary(id) and id != "" -> Map.put(body, :container, id)
+      _ -> body
+    end
   end
 
   defp shape_subscription_body(body, %Req.Request{} = request) do

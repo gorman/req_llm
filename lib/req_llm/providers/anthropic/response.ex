@@ -89,12 +89,15 @@ defmodule ReqLLM.Providers.Anthropic.Response do
       %{"type" => "message_start", "message" => message} ->
         usage_data = Map.get(message, "usage", %{})
 
-        if usage_data == %{} do
-          []
-        else
-          usage = parse_usage(usage_data)
-          [ReqLLM.StreamChunk.meta(%{usage: usage})]
-        end
+        usage_chunks =
+          if usage_data == %{} do
+            []
+          else
+            usage = parse_usage(usage_data)
+            [ReqLLM.StreamChunk.meta(%{usage: usage})]
+          end
+
+        container_chunks(message) ++ usage_chunks
 
       %{"type" => "content_block_delta", "index" => index, "delta" => delta} ->
         decode_content_block_delta(delta, index)
@@ -121,6 +124,8 @@ defmodule ReqLLM.Providers.Anthropic.Response do
             terminal?: true
           })
         ]
+
+        chunks = container_chunks(delta) ++ chunks
 
         # Add usage chunk if present
         if raw_usage == %{} do
@@ -562,13 +567,26 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   defp message_start_chunks(message) do
     usage_data = Map.get(message, "usage", %{})
 
-    if usage_data == %{} do
-      []
-    else
-      usage = parse_usage(usage_data)
-      [ReqLLM.StreamChunk.meta(%{usage: usage})]
-    end
+    usage_chunks =
+      if usage_data == %{} do
+        []
+      else
+        usage = parse_usage(usage_data)
+        [ReqLLM.StreamChunk.meta(%{usage: usage})]
+      end
+
+    container_chunks(message) ++ usage_chunks
   end
+
+  # The code-execution container descriptor rides message_start when the
+  # sandbox already exists (reuse) and message_delta once one is created
+  # mid-turn. Resuming a pause_turn with pending code-execution tool uses
+  # requires sending its id back, so surface it as response metadata.
+  defp container_chunks(%{"container" => %{"id" => _} = container}) do
+    [ReqLLM.StreamChunk.meta(%{container: container})]
+  end
+
+  defp container_chunks(_), do: []
 
   defp message_delta_chunks(data, delta) do
     stop_reason = Map.get(delta, "stop_reason")
@@ -586,6 +604,8 @@ defmodule ReqLLM.Providers.Anthropic.Response do
         terminal?: true
       })
     ]
+
+    chunks = container_chunks(delta) ++ chunks
 
     if raw_usage == %{} do
       chunks
