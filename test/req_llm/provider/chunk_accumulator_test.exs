@@ -398,6 +398,43 @@ defmodule ReqLLM.Provider.ChunkAccumulatorTest do
       refute_received {:args_lost, "call_empty_fragments", _, _}
     end
 
+    test "zero fragments on a completed block means empty args, not args_lost" do
+      attach_args_lost_handler("call_empty_args")
+
+      acc =
+        ChunkAccumulator.new()
+        |> ChunkAccumulator.push(%StreamChunk{
+          type: :tool_call,
+          name: "list_channels",
+          arguments: %{},
+          metadata: %{id: "call_empty_args", index: 0, start: true}
+        })
+        |> ChunkAccumulator.push(StreamChunk.meta(%{tool_call_complete: 0}))
+
+      assert [call] = ChunkAccumulator.finalize_tool_calls_for_response(acc)
+      assert call.arguments == %{}
+      refute match?(%{metadata: %{error: _}}, call)
+
+      refute_receive {:args_lost, "call_empty_args", _, _}
+    end
+
+    test "a completed block elsewhere does not vouch for a different index" do
+      attach_args_lost_handler("call_other_index")
+
+      acc =
+        ChunkAccumulator.new()
+        |> ChunkAccumulator.push(%StreamChunk{
+          type: :tool_call,
+          name: "get_weather",
+          arguments: %{},
+          metadata: %{id: "call_other_index", index: 1, start: true}
+        })
+        |> ChunkAccumulator.push(StreamChunk.meta(%{tool_call_complete: 0}))
+
+      assert [%{metadata: %{error: {:args_lost, :missing_fragments}}}] =
+               ChunkAccumulator.finalize_tool_calls_for_response(acc)
+    end
+
     test "returns [] for empty accumulator" do
       assert ChunkAccumulator.finalize_tool_calls_for_response(ChunkAccumulator.new()) == []
     end

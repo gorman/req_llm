@@ -95,6 +95,7 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
           stop_reason: String.t() | nil,
           usage: map() | nil,
           container: map() | nil,
+          completed_tool_indexes: MapSet.t(),
           provider_blocks: [{atom(), map()}]
         }
 
@@ -111,6 +112,7 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
             stop_reason: nil,
             usage: nil,
             container: nil,
+            completed_tool_indexes: MapSet.new(),
             provider_blocks: []
 
   @doc "Returns an empty accumulator."
@@ -197,6 +199,7 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
     |> push_stop_reason(metadata)
     |> push_usage(metadata)
     |> push_container(metadata)
+    |> push_tool_call_complete(metadata)
     |> push_provider_block(metadata)
   end
 
@@ -291,6 +294,15 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
   end
 
   defp push_container(acc, _metadata), do: acc
+
+  # The provider vouches that a tool_use block closed cleanly (its
+  # content_block_stop arrived), so zero arg fragments means genuinely empty
+  # args rather than args cut off mid-stream.
+  defp push_tool_call_complete(acc, %{tool_call_complete: index}) when is_integer(index) do
+    %{acc | completed_tool_indexes: MapSet.put(acc.completed_tool_indexes, index)}
+  end
+
+  defp push_tool_call_complete(acc, _metadata), do: acc
 
   defp tool_call_args_fragment(metadata) do
     args = Map.get(metadata, :tool_call_args) || Map.get(metadata, "tool_call_args")
@@ -459,20 +471,28 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
   @spec finalize_tool_calls_for_response(t()) :: [map()]
   def finalize_tool_calls_for_response(%__MODULE__{
         tool_calls: tool_calls,
-        arg_fragments: fragments
+        arg_fragments: fragments,
+        completed_tool_indexes: completed
       }) do
     tool_calls
     |> Enum.reverse()
-    |> Enum.map(&response_tool_call(&1, fragments))
+    |> Enum.map(&response_tool_call(&1, fragments, completed))
   end
 
-  defp response_tool_call(tool_call, fragments) do
+  defp response_tool_call(tool_call, fragments, completed) do
     case Map.get(fragments, tool_call.index) do
       nil ->
-        if Map.get(tool_call, :expects_arg_fragments, false) do
-          args_lost(tool_call, :missing_fragments)
-        else
-          drop_accumulator_fields(tool_call)
+        cond do
+          not Map.get(tool_call, :expects_arg_fragments, false) ->
+            drop_accumulator_fields(tool_call)
+
+          # Zero fragments on a block the provider closed cleanly is the
+          # normal wire shape of an empty-args call, not a transport loss.
+          MapSet.member?(completed, tool_call.index) ->
+            drop_accumulator_fields(tool_call)
+
+          true ->
+            args_lost(tool_call, :missing_fragments)
         end
 
       iodata ->

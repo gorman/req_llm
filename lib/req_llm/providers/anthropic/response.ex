@@ -344,6 +344,14 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     {[server_block_chunk(block)], state}
   end
 
+  # Client tool_use blocks are tracked so content_block_stop can vouch that
+  # the block closed cleanly: zero input_json_delta fragments on a closed
+  # block means genuinely empty args, while zero fragments on a block the
+  # stream never closed means the args were cut off in transport.
+  defp decode_content_block_start(%{"type" => "tool_use"} = block, index, state) do
+    {decode_content_block_start(block, index), track_tool_block(state, index)}
+  end
+
   defp decode_content_block_start(block, index, state) do
     {decode_content_block_start(block, index), state}
   end
@@ -510,9 +518,29 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   # else falls through to thinking finalization.
   defp finalize_content_block(index, state) do
     case pop_server_block(state, index) do
-      {nil, state} -> finalize_thinking_block(index, state)
+      {nil, state} -> finalize_tool_or_thinking_block(index, state)
       {block, state} -> {[server_block_chunk(block)], state}
     end
+  end
+
+  defp finalize_tool_or_thinking_block(index, state) do
+    if tool_block_tracked?(state, index) do
+      {[ReqLLM.StreamChunk.meta(%{tool_call_complete: index})], untrack_tool_block(state, index)}
+    else
+      finalize_thinking_block(index, state)
+    end
+  end
+
+  defp track_tool_block(state, index) do
+    Map.update(state, :open_tool_blocks, MapSet.new([index]), &MapSet.put(&1, index))
+  end
+
+  defp tool_block_tracked?(state, index) do
+    state |> Map.get(:open_tool_blocks, MapSet.new()) |> MapSet.member?(index)
+  end
+
+  defp untrack_tool_block(state, index) do
+    Map.update(state, :open_tool_blocks, MapSet.new(), &MapSet.delete(&1, index))
   end
 
   defp put_server_block(state, index, block) do

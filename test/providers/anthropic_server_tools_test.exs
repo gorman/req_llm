@@ -347,6 +347,71 @@ defmodule ReqLLM.Providers.AnthropicServerToolsTest do
     end
   end
 
+  describe "client tool_use block completion tracking" do
+    test "content_block_stop of a tool_use block emits a tool_call_complete marker" do
+      events = [
+        %{
+          data: %{
+            "type" => "content_block_start",
+            "index" => 0,
+            "content_block" => %{"type" => "tool_use", "id" => "toolu_1", "name" => "list_channels"}
+          }
+        },
+        %{data: %{"type" => "content_block_stop", "index" => 0}}
+      ]
+
+      {chunks, _state} =
+        Enum.reduce(events, {[], Anthropic.init_stream_state(model())}, fn event, {acc, state} ->
+          {event_chunks, next_state} = Anthropic.decode_stream_event(event, model(), state)
+          {acc ++ event_chunks, next_state}
+        end)
+
+      assert Enum.any?(chunks, &match?(%{metadata: %{tool_call_complete: 0}}, &1))
+    end
+
+    test "a tool_use block the stream never closes emits no completion marker" do
+      event = %{
+        data: %{
+          "type" => "content_block_start",
+          "index" => 0,
+          "content_block" => %{"type" => "tool_use", "id" => "toolu_1", "name" => "list_channels"}
+        }
+      }
+
+      {chunks, _state} =
+        Anthropic.decode_stream_event(event, model(), Anthropic.init_stream_state(model()))
+
+      refute Enum.any?(chunks, &match?(%{metadata: %{tool_call_complete: _}}, &1))
+    end
+
+    test "content_block_stop of a server block still emits the completed block, not a tool marker" do
+      events = [
+        %{
+          data: %{
+            "type" => "content_block_start",
+            "index" => 0,
+            "content_block" => %{
+              "type" => "server_tool_use",
+              "id" => "srvtoolu_1",
+              "name" => "web_search",
+              "input" => %{}
+            }
+          }
+        },
+        %{data: %{"type" => "content_block_stop", "index" => 0}}
+      ]
+
+      {chunks, _state} =
+        Enum.reduce(events, {[], Anthropic.init_stream_state(model())}, fn event, {acc, state} ->
+          {event_chunks, next_state} = Anthropic.decode_stream_event(event, model(), state)
+          {acc ++ event_chunks, next_state}
+        end)
+
+      assert Enum.any?(chunks, &match?(%{metadata: %{provider_block: %{"type" => "server_tool_use"}}}, &1))
+      refute Enum.any?(chunks, &match?(%{metadata: %{tool_call_complete: _}}, &1))
+    end
+  end
+
   describe "code_execution server tool" do
     test "encode_body adds the tool and its beta header" do
       context = %ReqLLM.Context{
