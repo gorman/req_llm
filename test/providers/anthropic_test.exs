@@ -1706,7 +1706,7 @@ defmodule ReqLLM.Providers.AnthropicTest do
 
       assert length(decoded["tools"]) == 2
       tool_types = Enum.map(decoded["tools"], & &1["type"])
-      assert "web_search_20250305" in tool_types
+      assert "web_search_20260209" in tool_types
       assert "web_fetch_20260209" in tool_types
     end
   end
@@ -1834,7 +1834,7 @@ defmodule ReqLLM.Providers.AnthropicTest do
       assert length(decoded["tools"]) == 1
 
       [web_search_tool] = decoded["tools"]
-      assert web_search_tool["type"] == "web_search_20250305"
+      assert web_search_tool["type"] == "web_search_20260209"
       assert web_search_tool["name"] == "web_search"
       assert web_search_tool["max_uses"] == 5
       assert web_search_tool["allowed_domains"] == ["wikipedia.org", "britannica.com"]
@@ -1870,7 +1870,7 @@ defmodule ReqLLM.Providers.AnthropicTest do
       decoded = ReqLLM.Test.Helpers.json_body(updated_request)
 
       [web_search_tool] = decoded["tools"]
-      assert web_search_tool["type"] == "web_search_20250305"
+      assert web_search_tool["type"] == "web_search_20260209"
       assert web_search_tool["max_uses"] == 3
       # After JSON encoding/decoding, keys become strings
       assert web_search_tool["user_location"]["type"] == "approximate"
@@ -1901,7 +1901,7 @@ defmodule ReqLLM.Providers.AnthropicTest do
       decoded = ReqLLM.Test.Helpers.json_body(updated_request)
 
       [web_search_tool] = decoded["tools"]
-      assert web_search_tool["type"] == "web_search_20250305"
+      assert web_search_tool["type"] == "web_search_20260209"
       assert web_search_tool["blocked_domains"] == ["untrustedsource.com"]
       refute Map.has_key?(web_search_tool, "max_uses")
     end
@@ -1940,7 +1940,7 @@ defmodule ReqLLM.Providers.AnthropicTest do
 
       [regular_tool, web_search_tool] = decoded["tools"]
       assert regular_tool["name"] == "get_weather"
-      assert web_search_tool["type"] == "web_search_20250305"
+      assert web_search_tool["type"] == "web_search_20260209"
       assert web_search_tool["name"] == "web_search"
       assert web_search_tool["max_uses"] == 5
     end

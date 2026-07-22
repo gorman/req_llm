@@ -413,7 +413,7 @@ defmodule ReqLLM.Providers.AnthropicServerToolsTest do
   end
 
   describe "code_execution server tool" do
-    test "encode_body adds the tool and its beta header" do
+    test "encode_body adds the code_execution tool" do
       context = %ReqLLM.Context{
         messages: [
           %ReqLLM.Message{role: :user, content: [ContentPart.text("run it")], metadata: %{}}
@@ -432,7 +432,7 @@ defmodule ReqLLM.Providers.AnthropicServerToolsTest do
       updated_request = Anthropic.encode_body(mock_request)
       decoded = ReqLLM.Test.Helpers.json_body(updated_request)
 
-      assert [%{"type" => "code_execution_20250522", "name" => "code_execution"}] =
+      assert [%{"type" => "code_execution_20260521", "name" => "code_execution"}] =
                decoded["tools"]
     end
   end
