@@ -243,6 +243,110 @@ defmodule ReqLLM.Providers.AnthropicServerToolsTest do
     end
   end
 
+  describe "code-execution container round-trip" do
+    @container %{"id" => "container_test123", "expires_at" => "2026-01-01T00:00:00Z"}
+
+    test "non-streaming decode keeps the container in provider_meta" do
+      data =
+        server_tool_response_data("pause_turn")
+        |> Map.put("container", @container)
+
+      {:ok, response} = Anthropic.Response.decode_response(data, model())
+
+      assert response.provider_meta["container"] == @container
+    end
+
+    test "streaming message_start surfaces the container as a meta chunk" do
+      event = %{
+        data: %{
+          "type" => "message_start",
+          "message" => %{"id" => "msg_test", "container" => @container, "usage" => %{}}
+        }
+      }
+
+      {chunks, _state} =
+        Anthropic.decode_stream_event(event, model(), Anthropic.init_stream_state(model()))
+
+      assert [%ReqLLM.StreamChunk{type: :meta, metadata: %{container: @container}}] = chunks
+    end
+
+    test "streaming message_delta surfaces a mid-turn container as a meta chunk" do
+      event = %{
+        data: %{
+          "type" => "message_delta",
+          "delta" => %{"stop_reason" => "pause_turn", "container" => @container},
+          "usage" => %{}
+        }
+      }
+
+      {chunks, _state} =
+        Anthropic.decode_stream_event(event, model(), Anthropic.init_stream_state(model()))
+
+      assert Enum.any?(chunks, &match?(%{metadata: %{container: @container}}, &1))
+    end
+
+    test "container meta chunks survive into the built response's provider_meta" do
+      chunks = [
+        ReqLLM.StreamChunk.meta(%{container: @container}),
+        ReqLLM.StreamChunk.text("Working on it."),
+        ReqLLM.StreamChunk.meta(%{
+          finish_reason: :incomplete,
+          stop_reason: "pause_turn",
+          terminal?: true
+        })
+      ]
+
+      {:ok, response} =
+        ReqLLM.Provider.Defaults.ResponseBuilder.build_response(
+          chunks,
+          %{finish_reason: :incomplete},
+          context: %ReqLLM.Context{messages: []},
+          model: model()
+        )
+
+      assert response.provider_meta["container"] == @container
+    end
+
+    test "encode_body sends anthropic_container as the top-level container param" do
+      context = %ReqLLM.Context{
+        messages: [
+          %ReqLLM.Message{role: :user, content: [ContentPart.text("resume")], metadata: %{}}
+        ]
+      }
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model().model,
+          stream: false,
+          anthropic_container: "container_test123"
+        ]
+      }
+
+      updated_request = Anthropic.encode_body(mock_request)
+      decoded = ReqLLM.Test.Helpers.json_body(updated_request)
+
+      assert decoded["container"] == "container_test123"
+    end
+
+    test "encode_body omits container when the option is absent" do
+      context = %ReqLLM.Context{
+        messages: [
+          %ReqLLM.Message{role: :user, content: [ContentPart.text("hi")], metadata: %{}}
+        ]
+      }
+
+      mock_request = %Req.Request{
+        options: [context: context, model: model().model, stream: false]
+      }
+
+      updated_request = Anthropic.encode_body(mock_request)
+      decoded = ReqLLM.Test.Helpers.json_body(updated_request)
+
+      refute Map.has_key?(decoded, "container")
+    end
+  end
+
   describe "code_execution server tool" do
     test "encode_body adds the tool and its beta header" do
       context = %ReqLLM.Context{

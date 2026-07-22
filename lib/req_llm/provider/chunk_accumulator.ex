@@ -86,6 +86,7 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
           finish_reason: atom() | String.t() | nil,
           stop_reason: String.t() | nil,
           usage: map() | nil,
+          container: map() | nil,
           provider_blocks: [{atom(), map()}]
         }
 
@@ -98,6 +99,7 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
             finish_reason: nil,
             stop_reason: nil,
             usage: nil,
+            container: nil,
             provider_blocks: []
 
   @doc "Returns an empty accumulator."
@@ -162,6 +164,7 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
     |> push_finish_reason(metadata)
     |> push_stop_reason(metadata)
     |> push_usage(metadata)
+    |> push_container(metadata)
     |> push_provider_block(metadata)
   end
 
@@ -222,6 +225,14 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
   end
 
   defp push_usage(acc, _metadata), do: acc
+
+  # The code-execution sandbox descriptor (e.g. Anthropic's `container`),
+  # required to resume a turn the provider paused mid-execution.
+  defp push_container(acc, %{container: container}) when is_map(container) do
+    %{acc | container: container}
+  end
+
+  defp push_container(acc, _metadata), do: acc
 
   defp tool_call_args_fragment(metadata) do
     args = Map.get(metadata, :tool_call_args) || Map.get(metadata, "tool_call_args")
@@ -300,6 +311,14 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
   """
   @spec finalize_stop_reason(t()) :: String.t() | nil
   def finalize_stop_reason(%__MODULE__{stop_reason: reason}), do: reason
+
+  @doc """
+  Returns the provider's code-execution sandbox descriptor (e.g. Anthropic's
+  `container`) from meta chunks, or `nil`. Resuming a paused turn whose
+  pending tool uses ran in the sandbox requires sending its id back.
+  """
+  @spec finalize_container(t()) :: map() | nil
+  def finalize_container(%__MODULE__{container: container}), do: container
 
   @doc """
   Returns `{provider, raw_block}` provider-native blocks in arrival order.
