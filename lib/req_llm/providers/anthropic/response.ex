@@ -704,7 +704,31 @@ defmodule ReqLLM.Providers.Anthropic.Response do
       {thinking_block, remaining_blocks} ->
         detail = build_reasoning_detail(thinking_block)
         chunk = ReqLLM.StreamChunk.meta(%{reasoning_details: [detail]})
-        {[chunk], %{state | thinking_blocks: remaining_blocks}}
+
+        # Also emit the block positionally. `reasoning_details` records only an
+        # ordinal among thinking blocks, so on its own it cannot say that this
+        # block came *after* a server-tool result — and the encoder therefore has
+        # to bucket thinking ahead of everything else. Anthropic rejects that
+        # reordering ("`thinking` blocks ... cannot be modified") on any turn
+        # where it thought between server-tool calls. Riding the same
+        # provider_block path the server-tool blocks use keeps position and
+        # signature intact, and the encoder already re-sends those verbatim.
+        {[chunk, server_block_chunk(raw_thinking_block(thinking_block))],
+         %{state | thinking_blocks: remaining_blocks}}
+    end
+  end
+
+  # Atom keys, matching what `encode_reasoning_details/1` has always emitted for
+  # thinking — the neighbouring server-tool provider blocks are string-keyed only
+  # because they come straight from decoded JSON. Both serialize identically, and
+  # keeping the established convention means no existing expectation moves.
+  # An unsigned block omits the key rather than sending an explicit null.
+  defp raw_thinking_block(%{text: text, signature: signature}) do
+    block = %{type: "thinking", thinking: text || ""}
+
+    case normalize_signature(signature) do
+      nil -> block
+      sig -> Map.put(block, :signature, sig)
     end
   end
 
