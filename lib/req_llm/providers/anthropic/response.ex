@@ -39,10 +39,16 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   # Content blocks produced by Anthropic server tools. `server_tool_use` is
   # listed separately where streaming is concerned: its `input` arrives via
   # input_json_delta fragments, while result blocks arrive complete.
+  # The code-execution tool answers under three different result types depending
+  # on which sub-tool the model reached for. A type missing here is dropped from
+  # the decoded content, so the next request carries the `server_tool_use` block
+  # with no result beside it and the API rejects the whole turn.
   @server_tool_result_types [
     "web_search_tool_result",
     "web_fetch_tool_result",
-    "code_execution_tool_result"
+    "code_execution_tool_result",
+    "bash_code_execution_tool_result",
+    "text_editor_code_execution_tool_result"
   ]
   @server_tool_block_types ["server_tool_use" | @server_tool_result_types]
 

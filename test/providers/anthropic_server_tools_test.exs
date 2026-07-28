@@ -184,6 +184,34 @@ defmodule ReqLLM.Providers.AnthropicServerToolsTest do
       assert block["type"] == "web_search_tool_result"
     end
 
+    # A dropped result type is only visible one request later, when the API
+    # rejects a server_tool_use block that has no result beside it.
+    test "every code-execution result type is carried, not just the python one" do
+      for type <- [
+            "code_execution_tool_result",
+            "bash_code_execution_tool_result",
+            "text_editor_code_execution_tool_result"
+          ] do
+        event = %{
+          data: %{
+            "type" => "content_block_start",
+            "index" => 1,
+            "content_block" => %{
+              "type" => type,
+              "tool_use_id" => "srvtoolu_1",
+              "content" => %{"type" => "bash_code_execution_result", "stdout" => "169"}
+            }
+          }
+        }
+
+        {chunks, _state} =
+          Anthropic.decode_stream_event(event, model(), Anthropic.init_stream_state(model()))
+
+        assert [%ReqLLM.StreamChunk{type: :meta, metadata: %{provider_block: block}}] = chunks
+        assert block["type"] == type
+      end
+    end
+
     test "streaming pause_turn normalizes to :incomplete with the raw stop_reason alongside" do
       event = %{
         data: %{
