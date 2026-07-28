@@ -394,7 +394,11 @@ defmodule ReqLLM.Providers.AnthropicServerToolsTest do
           data: %{
             "type" => "content_block_start",
             "index" => 0,
-            "content_block" => %{"type" => "tool_use", "id" => "toolu_1", "name" => "list_channels"}
+            "content_block" => %{
+              "type" => "tool_use",
+              "id" => "toolu_1",
+              "name" => "list_channels"
+            }
           }
         },
         %{data: %{"type" => "content_block_stop", "index" => 0}}
@@ -447,7 +451,11 @@ defmodule ReqLLM.Providers.AnthropicServerToolsTest do
           {acc ++ event_chunks, next_state}
         end)
 
-      assert Enum.any?(chunks, &match?(%{metadata: %{provider_block: %{"type" => "server_tool_use"}}}, &1))
+      assert Enum.any?(
+               chunks,
+               &match?(%{metadata: %{provider_block: %{"type" => "server_tool_use"}}}, &1)
+             )
+
       refute Enum.any?(chunks, &match?(%{metadata: %{tool_call_complete: _}}, &1))
     end
   end

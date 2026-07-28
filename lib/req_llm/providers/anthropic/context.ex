@@ -451,10 +451,24 @@ defmodule ReqLLM.Providers.Anthropic.Context do
   defp decode_tool_arguments(args) when is_map(args), do: args
   defp decode_tool_arguments(nil), do: %{}
 
+  # When the decoded content already carries its thinking blocks positionally
+  # (as provider blocks), prepending the `reasoning_details` copies would both
+  # duplicate them and move them ahead of the server-tool blocks they followed —
+  # which Anthropic rejects as a modified thinking block. Content order wins.
   defp combine_all_content_blocks(thinking_blocks, text_blocks, tool_blocks)
        when is_list(text_blocks) do
-    thinking_blocks ++ text_blocks ++ tool_blocks
+    if Enum.any?(text_blocks, &thinking_block?/1) do
+      text_blocks ++ tool_blocks
+    else
+      thinking_blocks ++ text_blocks ++ tool_blocks
+    end
   end
+
+  # Accepts either key convention: thinking blocks are atom-keyed, but a block
+  # replayed verbatim from a decoded response could arrive string-keyed.
+  defp thinking_block?(%{type: "thinking"}), do: true
+  defp thinking_block?(%{"type" => "thinking"}), do: true
+  defp thinking_block?(_), do: false
 
   defp combine_all_content_blocks(thinking_blocks, "", tool_blocks) do
     thinking_blocks ++ tool_blocks
