@@ -298,7 +298,12 @@ defmodule ReqLLM.Providers.Anthropic.Response do
        )
        when is_binary(fragment) do
     if server_block_pending?(state, index) do
-      {[], append_server_block_fragment(state, index, fragment)}
+      # A keepalive rides each absorbed fragment. A server tool's input can take
+      # minutes to generate, and emitting nothing leaves the consumer's idle
+      # timeout unable to tell a progressing stream from a dead one — the turn
+      # dies mid-generation even though data is arriving the whole time.
+      {[ReqLLM.StreamChunk.meta(%{keepalive?: true, provider_event: :server_tool_input_delta})],
+       append_server_block_fragment(state, index, fragment)}
     else
       {decode_content_block_delta(delta, index), state}
     end

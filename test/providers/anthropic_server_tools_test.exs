@@ -155,8 +155,20 @@ defmodule ReqLLM.Providers.AnthropicServerToolsTest do
           {acc ++ event_chunks, next_state}
         end)
 
+      # One keepalive per absorbed fragment: the fragments themselves are held
+      # back until the block closes, so without these the consumer sees nothing
+      # for however long the model spends writing the tool's input and its idle
+      # timeout fires on a stream that is in fact progressing.
       assert [
                %ReqLLM.StreamChunk{type: :meta, metadata: %{server_tool_started: "web_search"}},
+               %ReqLLM.StreamChunk{
+                 type: :meta,
+                 metadata: %{keepalive?: true, provider_event: :server_tool_input_delta}
+               },
+               %ReqLLM.StreamChunk{
+                 type: :meta,
+                 metadata: %{keepalive?: true, provider_event: :server_tool_input_delta}
+               },
                %ReqLLM.StreamChunk{type: :meta, metadata: %{provider_block: block}}
              ] = chunks
 
