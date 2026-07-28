@@ -660,6 +660,41 @@ defmodule ReqLLM.Providers.AnthropicTest do
       refute Jason.encode!(decoded) =~ "req_llm"
     end
 
+    test "encode_body converts a container_upload file part to a container upload block" do
+      {:ok, model} = ReqLLM.model("anthropic:claude-sonnet-4-5-20250929")
+
+      context =
+        ReqLLM.Context.new([
+          ReqLLM.Context.user([
+            ContentPart.text("Count the rows."),
+            ContentPart.file_id("file_011CNha8iCJcU1wXNR6q4V8w", "text/csv", %{
+              container_upload?: true
+            })
+          ])
+        ])
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model,
+          stream: false
+        ]
+      }
+
+      updated_request = Anthropic.encode_body(mock_request)
+      decoded = ReqLLM.Test.Helpers.json_body(updated_request)
+
+      [user_message] = decoded["messages"]
+      [_text_block, upload_block] = user_message["content"]
+
+      # No `source` wrapper and no media type: the container mounts the file, so
+      # the block is a bare reference rather than prompt content.
+      assert upload_block == %{
+               "type" => "container_upload",
+               "file_id" => "file_011CNha8iCJcU1wXNR6q4V8w"
+             }
+    end
+
     test "encode_body without tools" do
       {:ok, model} = ReqLLM.model("anthropic:claude-sonnet-4-5-20250929")
       context = context_fixture()

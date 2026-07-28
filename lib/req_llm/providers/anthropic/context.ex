@@ -322,6 +322,22 @@ defmodule ReqLLM.Providers.Anthropic.Context do
     }
   end
 
+  # A file the code-execution tool should compute over is mounted into the
+  # container's filesystem instead of being read into the prompt. Given only a
+  # document block, the model's one route to running code over an uploaded file
+  # is to retype its whole content into the tool input.
+  #
+  # This clause must precede the general file clause below, which matches the
+  # same shape.
+  defp do_encode_content_part(%ReqLLM.Message.ContentPart{
+         type: :file,
+         file_id: file_id,
+         metadata: %{container_upload?: true}
+       })
+       when is_binary(file_id) and file_id != "" do
+    %{type: "container_upload", file_id: file_id}
+  end
+
   defp do_encode_content_part(
          %ReqLLM.Message.ContentPart{
            type: :file,
