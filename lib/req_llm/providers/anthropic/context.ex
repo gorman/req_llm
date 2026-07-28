@@ -464,12 +464,6 @@ defmodule ReqLLM.Providers.Anthropic.Context do
     end
   end
 
-  # Accepts either key convention: thinking blocks are atom-keyed, but a block
-  # replayed verbatim from a decoded response could arrive string-keyed.
-  defp thinking_block?(%{type: "thinking"}), do: true
-  defp thinking_block?(%{"type" => "thinking"}), do: true
-  defp thinking_block?(_), do: false
-
   defp combine_all_content_blocks(thinking_blocks, "", tool_blocks) do
     thinking_blocks ++ tool_blocks
   end
@@ -478,6 +472,12 @@ defmodule ReqLLM.Providers.Anthropic.Context do
        when is_binary(text_string) do
     thinking_blocks ++ [%{type: "text", text: text_string}] ++ tool_blocks
   end
+
+  # Accepts either key convention: thinking blocks are atom-keyed, but a block
+  # replayed verbatim from a decoded response could arrive string-keyed.
+  defp thinking_block?(%{type: "thinking"}), do: true
+  defp thinking_block?(%{"type" => "thinking"}), do: true
+  defp thinking_block?(_), do: false
 
   defp encode_reasoning_details(nil), do: []
   defp encode_reasoning_details([]), do: []

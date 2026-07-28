@@ -198,7 +198,7 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   def flush_stream_state(_model, state) do
     state = ensure_stream_state(state)
     {details, state} = drain_thinking_blocks(state)
-    {reasoning_detail_chunks(details), state}
+    {reasoning_detail_chunks(details) ++ drained_provider_blocks(details), state}
   end
 
   # Private helper functions
@@ -748,6 +748,19 @@ defmodule ReqLLM.Providers.Anthropic.Response do
 
   defp reasoning_detail_chunks(details),
     do: [ReqLLM.StreamChunk.meta(%{reasoning_details: details})]
+
+  # A block the stream never closed is drained here instead of at
+  # content_block_stop, so it misses the positional copy its closed siblings get.
+  # Without one it exists only in `reasoning_details`, and the encoder — which
+  # defers to content order as soon as any thinking block is there positionally —
+  # would drop it, replaying a turn one thinking block short. Only a signed block
+  # is replayable at all: Anthropic requires the signature, so an unsigned partial
+  # stays out of the content either way.
+  defp drained_provider_blocks(details) do
+    details
+    |> Enum.filter(&(normalize_signature(&1.signature) != nil))
+    |> Enum.map(&server_block_chunk(raw_thinking_block(&1)))
+  end
 
   defp build_reasoning_detail(thinking_block) do
     signature = normalize_signature(thinking_block.signature)

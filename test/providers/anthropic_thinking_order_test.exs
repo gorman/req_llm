@@ -126,6 +126,72 @@ defmodule ReqLLM.Providers.AnthropicThinkingOrderTest do
     ]
   end
 
+  # The same turn, but the model narrates before it searches:
+  # [thinking, text, server_tool_use, web_search_tool_result, thinking, text].
+  # The spliced-in index is immaterial — text blocks carry no per-index stream state.
+  defp narrated_events do
+    {thinking, rest} = Enum.split(interleaved_events(), 4)
+    thinking ++ text_events(5, "Let me look that up. ") ++ rest
+  end
+
+  defp text_events(index, text) do
+    [
+      %{
+        data: %{
+          "type" => "content_block_start",
+          "index" => index,
+          "content_block" => %{"type" => "text", "text" => ""}
+        }
+      },
+      %{
+        data: %{
+          "type" => "content_block_delta",
+          "index" => index,
+          "delta" => %{"type" => "text_delta", "text" => text}
+        }
+      },
+      %{data: %{"type" => "content_block_stop", "index" => index}}
+    ]
+  end
+
+  # A thinking block the stream never closes: deltas arrive, `content_block_stop`
+  # never does, so `flush_stream_state/2` drains it instead of
+  # `finalize_thinking_block/2`.
+  defp cut_stream_events(signed?) do
+    signature =
+      if signed? do
+        [
+          %{
+            data: %{
+              "type" => "content_block_delta",
+              "index" => 3,
+              "delta" => %{"type" => "signature_delta", "signature" => "SIG-B"}
+            }
+          }
+        ]
+      else
+        []
+      end
+
+    Enum.take(interleaved_events(), 8) ++
+      [
+        %{
+          data: %{
+            "type" => "content_block_start",
+            "index" => 3,
+            "content_block" => %{"type" => "thinking", "thinking" => ""}
+          }
+        },
+        %{
+          data: %{
+            "type" => "content_block_delta",
+            "index" => 3,
+            "delta" => %{"type" => "thinking_delta", "thinking" => "Highs low 80s."}
+          }
+        }
+      ] ++ signature
+  end
+
   defp decode_stream(events) do
     {chunks, _state} =
       Enum.reduce(events, {[], Anthropic.init_stream_state(model())}, fn event, {acc, state} ->
@@ -134,6 +200,18 @@ defmodule ReqLLM.Providers.AnthropicThinkingOrderTest do
       end)
 
     chunks
+  end
+
+  defp decode_stream_and_flush(events) do
+    {chunks, state} =
+      Enum.reduce(events, {[], Anthropic.init_stream_state(model())}, fn event, {acc, state} ->
+        {event_chunks, next_state} = Anthropic.decode_stream_event(event, model(), state)
+        {acc ++ event_chunks, next_state}
+      end)
+
+    {flush_chunks, _state} = Anthropic.flush_stream_state(model(), state)
+
+    chunks ++ flush_chunks
   end
 
   defp materialize(chunks) do
@@ -243,6 +321,66 @@ defmodule ReqLLM.Providers.AnthropicThinkingOrderTest do
 
       sigs = for %{type: "thinking"} = b <- blocks, do: b[:signature]
       assert sigs == ["SIG-A", "SIG-B"]
+    end
+  end
+
+  describe "narration before the search" do
+    # The accumulator coalesces every text run into one trailing part
+    # (`provider_block_parts ++ text_parts`), so narration that came *before* the
+    # search is replayed after it and the second thinking block shifts one slot
+    # earlier. Anthropic accepts that — an empirical finding, not a documented
+    # contract: verified 2026-07-28 against claude-sonnet-4-6 by replaying one
+    # real turn three ways behind a tool_result — true order (200),
+    # this order (200), thinking bucketed first (400, `messages.1.content.1`). What
+    # it enforces is thinking's position relative to the other non-text blocks,
+    # which is what the positional provider blocks restore.
+    test "text coalesces at the end and thinking still follows the server-tool result" do
+      types = decode_stream(narrated_events()) |> materialize() |> encoded_block_types()
+
+      assert types == [
+               "thinking",
+               "server_tool_use",
+               "web_search_tool_result",
+               "thinking",
+               "text"
+             ]
+    end
+
+    test "no narration is lost — both runs are replayed, joined" do
+      message = decode_stream(narrated_events()) |> materialize()
+
+      %{messages: [%{content: blocks}]} =
+        Anthropic.Context.encode_request(%ReqLLM.Context{messages: [message]}, model())
+
+      assert [%{type: "text", text: text}] = Enum.filter(blocks, &(&1[:type] == "text"))
+      assert text == "Let me look that up. Here are the blocks:"
+    end
+  end
+
+  describe "a thinking block the stream never closed" do
+    test "a signed block is still replayed — content order must not drop it" do
+      message = decode_stream_and_flush(cut_stream_events(true)) |> materialize()
+
+      assert encoded_block_types(message) == [
+               "thinking",
+               "server_tool_use",
+               "web_search_tool_result",
+               "thinking"
+             ]
+
+      %{messages: [%{content: blocks}]} =
+        Anthropic.Context.encode_request(%ReqLLM.Context{messages: [message]}, model())
+
+      assert [_first, %{thinking: "Highs low 80s.", signature: "SIG-B"}] =
+               Enum.filter(blocks, &(&1[:type] == "thinking"))
+    end
+
+    test "an unsigned block stays off the wire — Anthropic requires the signature" do
+      message = decode_stream_and_flush(cut_stream_events(false)) |> materialize()
+
+      # Still reported to consumers, just not replayable.
+      assert length(message.reasoning_details) == 2
+      assert Enum.count(encoded_block_types(message), &(&1 == "thinking")) == 1
     end
   end
 
