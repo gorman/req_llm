@@ -154,6 +154,12 @@ defmodule ReqLLM.Streaming.Retry do
        when reason in @retryable_reasons,
        do: {:retry, 0}
 
+  # Finch.stream/5 wraps the Mint error, so the Mint clause above never sees a
+  # real transport failure. The wrapper mirrors the Mint reason in :reason.
+  defp classify_error(%Finch.TransportError{reason: reason}, _state)
+       when reason in @retryable_reasons,
+       do: {:retry, 0}
+
   defp classify_error(_reason, %{status: 429} = state) do
     {:retry, extract_retry_after_delay(state.headers)}
   end
