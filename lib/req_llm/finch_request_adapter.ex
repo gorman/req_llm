@@ -41,6 +41,13 @@ defmodule ReqLLM.FinchRequestAdapter do
   The request has already been fully built by the provider (authentication,
   body encoding, base headers). Return a `Finch.Request` — either the original
   or a modified copy.
+
+  Return `{:error, reason}` to stop the request instead of sending it. The
+  reason travels the same path as any other build failure, so the caller gets
+  `{:error, {:provider_build_failed, reason}}` rather than a stream that dies
+  mid-flight. This is the only seam that sees the assembled body, so it is the
+  only place a size or content guard can act on what is actually going to be
+  sent.
   """
-  @callback call(Finch.Request.t()) :: Finch.Request.t()
+  @callback call(Finch.Request.t()) :: Finch.Request.t() | {:error, term()}
 end
