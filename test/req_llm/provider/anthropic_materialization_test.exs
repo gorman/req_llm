@@ -139,9 +139,14 @@ defmodule ReqLLM.Provider.AnthropicMaterializationTest do
     assert ToolCall.args_map(tool_call) == %{"q" => "docs"}
     assert ToolCall.metadata(tool_call) == %{}
 
+    # Fork divergence: 4af2d253 keeps "stop_reason" out of the drop list so the
+    # raw value survives normalisation. opal_ai resumes a "pause_turn" from it,
+    # and :unknown finish reasons (like this fixture's) carry no other record of
+    # what the provider actually said.
     assert response.provider_meta == %{
              "type" => "message",
              "role" => "assistant",
+             "stop_reason" => "future_stop_reason",
              "stop_sequence" => "END",
              "custom" => %{"trace" => "trace_123"}
            }

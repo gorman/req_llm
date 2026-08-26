@@ -220,7 +220,18 @@ defmodule ReqLLM.StreamEventProjectionTest do
       ]
 
       assert Enum.map(openai_events, & &1.type) == expected_types
-      assert Enum.map(anthropic_events, & &1.type) == expected_types
+
+      # Fork divergence: the Anthropic decoder also carries the raw stop_reason,
+      # which has no canonical equivalent and so projects as a :provider_event.
+      # The test's claim still holds — the canonical sequence is identical and an
+      # unrecognised :provider_event is ignorable, so no consumer branches on it.
+      assert anthropic_events
+             |> Enum.reject(&(&1.type == :provider_event))
+             |> Enum.map(& &1.type) == expected_types
+
+      assert Enum.find(anthropic_events, &(&1.type == :provider_event)).data == %{
+               stop_reason: "tool_use"
+             }
 
       assert Enum.find(openai_events, &(&1.type == :tool_call)).data.arguments == %{
                "q" => "elixir"

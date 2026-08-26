@@ -367,36 +367,6 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     {decode_content_block_start(block, index), state}
   end
 
-  defp build_message_from_chunks([]), do: nil
-
-  defp build_message_from_chunks(chunks) do
-    # A single ordered pass so provider blocks keep their position relative to
-    # text (a server_tool_use precedes its result, which precedes the text that
-    # cites it); chunk_to_content_part returns nil for non-part chunks.
-    content_parts =
-      chunks
-      |> Enum.map(&chunk_to_content_part/1)
-      |> Enum.reject(&is_nil/1)
-
-    tool_calls =
-      chunks
-      |> Enum.filter(&(&1.type == :tool_call))
-      |> Enum.map(&chunk_to_tool_call/1)
-      |> Enum.reject(&is_nil/1)
-
-    reasoning_details = extract_reasoning_details(chunks)
-
-    if content_parts != [] or tool_calls != [] do
-      %ReqLLM.Message{
-        role: :assistant,
-        content: content_parts,
-        tool_calls: if(tool_calls != [], do: tool_calls),
-        reasoning_details: if(reasoning_details != [], do: reasoning_details),
-        metadata: %{}
-      }
-    end
-  end
-
   defp extract_reasoning_details(chunks) do
     chunks
     |> Enum.filter(&(&1.type == :thinking))
@@ -415,36 +385,6 @@ defmodule ReqLLM.Providers.Anthropic.Response do
       }
     end)
   end
-
-  defp chunk_to_content_part(%ReqLLM.StreamChunk{type: :content, text: text}) do
-    %ReqLLM.Message.ContentPart{type: :text, text: text}
-  end
-
-  defp chunk_to_content_part(%ReqLLM.StreamChunk{type: :thinking, text: text}) do
-    %ReqLLM.Message.ContentPart{type: :thinking, text: text}
-  end
-
-  defp chunk_to_content_part(%ReqLLM.StreamChunk{
-         type: :meta,
-         metadata: %{provider_block: block}
-       }) do
-    ReqLLM.Message.ContentPart.provider_block(block, :anthropic)
-  end
-
-  defp chunk_to_content_part(_), do: nil
-
-  defp chunk_to_tool_call(%ReqLLM.StreamChunk{
-         type: :tool_call,
-         name: name,
-         arguments: args,
-         metadata: meta
-       }) do
-    args_json = if is_binary(args), do: args, else: Jason.encode!(args)
-    id = Map.get(meta, :id)
-    ReqLLM.ToolCall.new(id, name, args_json)
-  end
-
-  defp chunk_to_tool_call(_), do: nil
 
   defp parse_usage(usage) when is_map(usage) and map_size(usage) > 0 do
     input = Map.get(usage, "input_tokens", 0)
