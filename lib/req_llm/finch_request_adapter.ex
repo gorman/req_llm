@@ -15,7 +15,8 @@ defmodule ReqLLM.FinchRequestAdapter do
 
   Both mechanisms can be combined. The config-level adapter is applied first,
   then the per-request `on_finch_request` callback (if given). Each step
-  receives the output of the previous one.
+  receives the output of the previous one. If the adapter refuses the request
+  with `{:error, reason}`, the callback does not run.
 
   ## Configuration
 
