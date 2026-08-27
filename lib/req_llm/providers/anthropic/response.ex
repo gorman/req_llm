@@ -131,7 +131,7 @@ defmodule ReqLLM.Providers.Anthropic.Response do
           })
         ]
 
-        chunks = container_chunks(delta) ++ chunks
+        chunks = container_chunks(delta) ++ context_management_chunks(data) ++ chunks
 
         # Add usage chunk if present
         if raw_usage == %{} do
@@ -454,7 +454,6 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   defp parse_finish_reason(reason) when is_binary(reason), do: :unknown
   defp parse_finish_reason(_), do: nil
 
-
   defp server_block_chunk(block) do
     ReqLLM.StreamChunk.meta(%{provider_block: block, provider: :anthropic})
   end
@@ -567,6 +566,16 @@ defmodule ReqLLM.Providers.Anthropic.Response do
 
   defp container_chunks(_), do: []
 
+  # What the API's context_management edits actually removed. A non-streaming
+  # response carries it in provider_meta already; on a stream it rides the
+  # closing message_delta, and without this there is no way to tell whether an
+  # edit fired at all.
+  defp context_management_chunks(%{"context_management" => %{} = report}) do
+    [ReqLLM.StreamChunk.meta(%{context_management: report})]
+  end
+
+  defp context_management_chunks(_), do: []
+
   defp message_delta_chunks(data, delta) do
     stop_reason = Map.get(delta, "stop_reason")
     finish_reason = parse_finish_reason(stop_reason) || :unknown
@@ -584,7 +593,7 @@ defmodule ReqLLM.Providers.Anthropic.Response do
       })
     ]
 
-    chunks = container_chunks(delta) ++ chunks
+    chunks = container_chunks(delta) ++ context_management_chunks(data) ++ chunks
 
     if raw_usage == %{} do
       chunks

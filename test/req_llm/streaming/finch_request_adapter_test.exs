@@ -110,6 +110,7 @@ defmodule ReqLLM.Streaming.FinchRequestAdapterTest do
 
       assert {:error, {:provider_build_failed, {:prompt_too_large, _}}} =
                build_stream(on_finch_request: callback)
+
       refute_receive :callback_ran
     end
   end

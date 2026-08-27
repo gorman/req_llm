@@ -169,6 +169,35 @@ defmodule ReqLLM.Providers.Anthropic do
 
       Example: "container_011CPR8tS8vNy3aDrRwLxo6i"
       """
+    ],
+    context_management: [
+      type: :map,
+      doc: """
+      Server-side context management, passed through as the `context_management`
+      request parameter. The API applies the edits before the prompt reaches the
+      model, so the conversation you send stays whole and nothing has to be
+      synced back.
+
+      The beta header each edit needs is derived from the edit types present,
+      because an edit sent without its header is a 400.
+
+      Note that `compact_20260112` returns a `compaction` block that must be
+      re-sent on every later request. This provider drops content blocks it does
+      not recognize, so compaction does not work yet — only the
+      `clear_*` edits do.
+
+      Example:
+
+          %{
+            edits: [
+              %{
+                type: "clear_tool_uses_20250919",
+                trigger: %{type: "input_tokens", value: 600_000},
+                keep: %{type: "tool_uses", value: 6}
+              }
+            ]
+          }
+      """
     ]
   ]
 
@@ -188,6 +217,16 @@ defmodule ReqLLM.Providers.Anthropic do
   @anthropic_beta_tools "tools-2024-05-16"
   @anthropic_beta_prompt_caching "prompt-caching-2024-07-31"
   @anthropic_beta_files_api "files-api-2025-04-14"
+
+  # Each context-management edit type carries its own beta flag, and an edit
+  # sent without its flag is rejected. Derived from the edits rather than left
+  # to the caller, who otherwise has to know this table to use the option at
+  # all.
+  @context_management_betas %{
+    "clear_tool_uses_20250919" => "context-management-2025-06-27",
+    "clear_thinking_20251015" => "context-management-2025-06-27",
+    "compact_20260112" => "compact-2026-01-12"
+  }
   @claude_subscription_betas ["oauth-2025-04-20", "interleaved-thinking-2025-05-14"]
   @claude_subscription_user_agent "claude-cli/2.1.112 (external, cli)"
   @claude_subscription_x_app "claude-code"
@@ -556,6 +595,7 @@ defmodule ReqLLM.Providers.Anthropic do
     |> Map.put(:max_tokens, max_tokens)
     |> maybe_add_tools(opts)
     |> maybe_put_container(opts)
+    |> maybe_put_context_management(opts)
     |> maybe_apply_prompt_caching(opts)
     |> maybe_add_output_format(opts)
   end
@@ -570,6 +610,24 @@ defmodule ReqLLM.Providers.Anthropic do
       id when is_binary(id) and id != "" -> Map.put(body, :container, id)
       _ -> body
     end
+  end
+
+  # Passed through untouched: the edit shapes are the API's, and validating
+  # them here would only add a second place to update when the API adds one.
+  defp maybe_put_context_management(body, opts) do
+    case context_management(opts) do
+      config when is_map(config) and map_size(config) > 0 ->
+        Map.put(body, :context_management, config)
+
+      _ ->
+        body
+    end
+  end
+
+  defp context_management(opts) do
+    provider_opts = get_option(opts, :provider_options, []) || []
+
+    get_option(opts, :context_management) || get_option(provider_opts, :context_management)
   end
 
   defp shape_subscription_body(body, %Req.Request{} = request) do
@@ -963,8 +1021,29 @@ defmodule ReqLLM.Providers.Anthropic do
         beta_features
       end
 
+    beta_features = context_management_betas(opts) ++ beta_features
+
     Enum.uniq(beta_features)
   end
+
+  defp context_management_betas(opts) do
+    opts
+    |> context_management()
+    |> context_management_edit_types()
+    |> Enum.flat_map(&List.wrap(Map.get(@context_management_betas, &1)))
+  end
+
+  # The option's own validation requires atom keys on the outer map, but the
+  # edits inside it are not checked, so an edit built from stored JSON arrives
+  # string-keyed. Missing its beta header fails the whole request.
+  defp context_management_edit_types(config) when is_map(config) do
+    config
+    |> map_value(:edits)
+    |> List.wrap()
+    |> Enum.flat_map(&List.wrap(map_value(&1, :type)))
+  end
+
+  defp context_management_edit_types(_config), do: []
 
   defp manual_beta_features(opts) do
     provider_opts = get_option(opts, :provider_options, [])
