@@ -46,16 +46,16 @@ These options are supported across providers (where the model allows):
 |--------|------|-------------|
 | `n` | integer | Number of images to generate (provider-dependent; gemini-2.5-flash-image and gemini-3-pro-image-preview reject `n`) |
 | `size` | string or tuple | Image dimensions, e.g., `"1024x1024"` or `{1024, 1024}` |
-| `aspect_ratio` | string | Aspect ratio, e.g., `"16:9"` or `"1:1"` |
+| `aspect_ratio` | string | Aspect ratio, e.g., `"16:9"` or `"1:1"` (on OpenAI and Azure this resolves to the nearest supported `size` — see below) |
 | `output_format` | atom | Image format: `:png`, `:jpeg`, or `:webp` |
 | `response_format` | atom | Return type: `:binary` (default) or `:url` |
 | `quality` | atom/string | Image quality (provider-dependent) |
-| `seed` | integer | Random seed for reproducibility (provider-dependent) |
-| `negative_prompt` | string | What to avoid in the image (provider-dependent) |
-| `source_image` | binary | Source image bytes for editing or reference generation (OpenAI image models only) |
-| `source_image_media_type` | string | MIME type for `source_image` (default: `"image/png"`; OpenAI image models only) |
-| `mask` | binary | Optional mask image bytes for inpainting/editing (OpenAI image models only) |
-| `mask_media_type` | string | MIME type for `mask` (default: `"image/png"`; OpenAI image models only) |
+| `seed` | integer | Random seed for reproducibility (provider-dependent; **not supported by OpenAI or Azure**) |
+| `negative_prompt` | string | What to avoid in the image (provider-dependent; **not supported by OpenAI or Azure**) |
+| `source_image` | binary | Source image bytes for editing or reference generation (OpenAI and Azure image models only) |
+| `source_image_media_type` | string | MIME type for `source_image` (default: `"image/png"`; OpenAI and Azure image models only) |
+| `mask` | binary | Optional mask image bytes for inpainting/editing (OpenAI and Azure image models only) |
+| `mask_media_type` | string | MIME type for `mask` (default: `"image/png"`; OpenAI and Azure image models only) |
 
 ## Discovering Available Models
 
@@ -86,6 +86,20 @@ The GPT Image family provides superior instruction following, text rendering, de
 | `gpt-image-1-mini` | Cost-effective option for simpler use cases |
 | `dall-e-3` | Removed from the OpenAI API on May 12, 2026; use GPT Image models instead |
 | `dall-e-2` | Removed from the OpenAI API on May 12, 2026; use GPT Image models instead |
+
+### Sizes and Aspect Ratios
+
+The Images API accepts a fixed set of sizes rather than a free-form aspect ratio, so `aspect_ratio` is resolved to the closest size the model offers. An explicit `size` always wins.
+
+| Requested ratio | GPT Image | DALL-E 3 | DALL-E 2 |
+|---|---|---|---|
+| square (`"1:1"`) | `1024x1024` | `1024x1024` | `1024x1024` |
+| landscape (`"16:9"`, `"3:2"`, …) | `1536x1024` | `1792x1024` | `1024x1024` |
+| portrait (`"9:16"`, `"2:3"`, …) | `1024x1536` | `1024x1792` | `1024x1024` |
+
+Because only three shapes exist, the result is an approximation: `"16:9"` yields a 3:2 image on GPT Image. Pass `size` directly when you need exact dimensions.
+
+`seed` and `negative_prompt` have no equivalent in the Images API and are rejected with `ReqLLM.Error.Invalid.Parameter` before the request is sent, rather than being forwarded and returning an `unknown_parameter` error from the provider. To steer away from unwanted content, describe the exclusion in the prompt itself.
 
 ### Image Editing
 
@@ -212,6 +226,49 @@ DALL-E 3 may automatically enhance your prompt for better results. The revised p
 revised = image_part.metadata[:revised_prompt]
 # => "A fluffy orange tabby cat sitting gracefully on a windowsill..."
 ```
+
+---
+
+## Azure
+
+Azure hosts the OpenAI GPT Image family (`gpt-image-1`, `gpt-image-1.5`, `gpt-image-2`) behind Azure OpenAI resources. The wire format matches OpenAI's Images API, so the same options apply, but Azure requires a `base_url` and a `deployment`:
+
+```elixir
+{:ok, response} = ReqLLM.generate_image(
+  "azure:gpt-image-1",
+  "A watercolor painting of a lighthouse",
+  base_url: "https://my-resource.openai.azure.com/openai",
+  deployment: "my-image-deployment",
+  size: "1024x1024"
+)
+```
+
+Image editing works the same way as OpenAI's (multipart upload with `source_image` and optional `mask`):
+
+```elixir
+{:ok, response} = ReqLLM.generate_image(
+  "azure:gpt-image-1",
+  "Make the sky stormy",
+  base_url: "https://my-resource.openai.azure.com/openai",
+  deployment: "my-image-deployment",
+  source_image: File.read!("lighthouse.png")
+)
+```
+
+Notes:
+
+- Supported endpoint formats: traditional Azure OpenAI (`https://<resource>.openai.azure.com/openai`, deployment in the URL path) and the v1 GA API (`.../openai/v1`, deployment sent as `model` in the body). Azure AI Foundry endpoints (`.services.ai.azure.com`) are not supported for image generation.
+- All three gpt-image models work on either endpoint format. A `DeploymentNotFound` (HTTP 404) means the `deployment` you passed does not exist on the resource — deployment names are chosen when the deployment is created and often differ from the model id, so pass `deployment:` explicitly rather than relying on the model-id default.
+- The default `api_version` (`2025-04-01-preview`) satisfies gpt-image models; override via `provider_options: [api_version: ...]` if needed.
+- GPT Image models always return base64 image data (`:binary`); URL responses are not available.
+- Option handling matches OpenAI's exactly, including `aspect_ratio` resolving to the nearest supported size and `seed`/`negative_prompt` being rejected — see [Sizes and Aspect Ratios](#sizes-and-aspect-ratios).
+- Azure supports `output_format: :png` and `output_format: :jpeg`. It does not support `:webp`, and ReqLLM rejects that value before it sends the request.
+- DALL-E models are retired on Azure — use gpt-image models.
+- Only `gpt-image-*` model ids are accepted. Chat models (e.g. `azure:gpt-4o`) are rejected locally with a `ReqLLM.Error.Invalid.Parameter` before any HTTP call, rather than failing at the API.
+- The `deployment` name is free-form and affects only the URL/body identifier. Option handling is keyed off the catalog model id, so a deployment named after a different model does not change which options are sent.
+- Responses carry provider metadata under `response.provider_meta["azure"]`, and `response.usage.image_usage` is populated the same way as for OpenAI.
+
+See the [Azure guide](azure.md) for authentication and deployment configuration.
 
 ---
 

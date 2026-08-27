@@ -14,7 +14,7 @@ OPENAI_API_KEY=sk-...
 
 For the full model-spec workflow, see [Model Specs](model-specs.md).
 
-Use exact OpenAI IDs from [LLMDB.xyz](https://llmdb.xyz) when possible. For brand-new model IDs, local OpenAI-compatible servers, or proxies, use `ReqLLM.model!/1` with `provider: :openai`, an explicit `id`, and `base_url` when needed.
+Use exact OpenAI IDs from [LLM Catalog](https://llmcatalog.dev) when possible. For brand-new model IDs, local OpenAI-compatible servers, or proxies, use `ReqLLM.model!/1` with `provider: :openai`, an explicit `id`, and `base_url` when needed.
 
 ### OAuth Access Token (optional)
 
@@ -93,15 +93,81 @@ ReqLLM.generate_text(
 
 If you need to customize the refresh HTTP client, pass `oauth_http_options` under `provider_options`.
 
-For `openai_codex`, you can also override the backend headers with:
+For `openai_codex`, you can also override backend request headers with:
 
 - `provider_options: [chatgpt_account_id: "..."]`
 - `provider_options: [codex_originator: "pi"]`
 
+ReqLLM applies the complete Responses Lite wire profile when the Codex model catalog marks a model with `use_responses_lite: true`. The bundled catalog currently enables that profile for GPT-5.6 Sol, Terra, and Luna. Explicit model specs can provide updated provider metadata under `extra.openai_codex.use_responses_lite`.
+
+Responses Lite is an internal Codex backend contract, not a mode of the public OpenAI Responses API. It sends instructions and client-executed tools as input items, uses persistent reasoning context, disables parallel tool calls, and marks the request with the Codex Responses Lite header. The canonical behavior is defined by the [Codex model metadata](https://github.com/openai/codex/blob/main/codex-rs/protocol/src/openai_models.rs) and [Responses Lite contract tests](https://github.com/openai/codex/blob/main/codex-rs/core/tests/suite/responses_lite.rs).
+
 ## Attachments
 
 OpenAI Chat Completions API only supports image attachments (JPEG, PNG, GIF, WebP).
-For document support (PDFs, etc.), use Anthropic or Google providers.
+OpenAI Responses models also support image and PDF file inputs. Inline and URL
+attachments continue to work as before.
+
+### Reusable OpenAI files
+
+`ReqLLM.Providers.OpenAI.Files` exposes the OpenAI Files lifecycle without
+adding uploads to the common provider behaviour. Uploading once can avoid
+repeating a large inline payload across Responses calls:
+
+```elixir
+alias ReqLLM.Message.ContentPart
+alias ReqLLM.Providers.OpenAI.Files
+
+{:ok, file} =
+  Files.upload(
+    ContentPart.file(pdf_bytes, "report.pdf", "application/pdf"),
+    purpose: :user_data,
+    expires_after: 86_400
+  )
+
+context =
+  ReqLLM.Context.new([
+    ReqLLM.Context.user([
+      ContentPart.text("Summarize this report."),
+      file
+    ])
+  ])
+
+{:ok, response} = ReqLLM.generate_text("openai:gpt-5", context)
+```
+
+`Files.upload/2` accepts an inline file `ContentPart`, a local path, or an
+explicit `{:binary, data, filename, media_type}` tuple. It returns the same
+owned `ContentPart` shape documented in [Data Structures](data-structures.md),
+including OpenAI ownership, purpose, filename, media type, size, status, and
+expiry when available. Inline inputs also include a locally calculated SHA-256.
+Local paths are streamed into the multipart request instead of being loaded
+into one large binary.
+
+Lifecycle operations remain provider-scoped:
+
+```elixir
+{:ok, current} = Files.retrieve(file)
+{:ok, %Files.Page{files: files, has_more: has_more}} =
+  Files.list(purpose: :user_data, limit: 100)
+
+{:ok, true} = Files.delete(current)
+```
+
+OpenAI retains most uploaded files until they are deleted. Use
+`:expires_after` when supported by the selected purpose, or delete references
+when they are no longer needed. Deletion accepts a known-expired reference so
+cleanup remains possible. The caller remains responsible for retention,
+pagination, and cleanup; ReqLLM does not run background workers or upload
+inputs automatically.
+
+Treat returned references as sensitive. Regular inspection and ReqLLM
+telemetry redact provider IDs, URLs, credentials, and file contents. Use
+`ContentPart.provider_file_reference/1` only when the complete provider record
+is required.
+
+See the [OpenAI Files API reference](https://platform.openai.com/docs/api-reference/files)
+for current purposes, retention rules, and service limits.
 
 ## Dual API Architecture
 
@@ -109,6 +175,26 @@ OpenAI provider automatically routes between two APIs based on model metadata:
 
 - **Chat Completions API**: Standard GPT models (gpt-4o, gpt-4-turbo, gpt-3.5-turbo)
 - **Responses API**: Reasoning models (o1, o3, o4-mini, gpt-5) with extended thinking
+
+### Chat Completions responsibilities
+
+The V1 provider callbacks and transports remain unchanged. Internally, Chat
+Completions responsibilities are intentionally narrow:
+
+| Responsibility | Before | Current owner |
+| --- | --- | --- |
+| Select Chat Completions or Responses and attach the Req pipeline | `ReqLLM.Providers.OpenAI` | `ReqLLM.Providers.OpenAI` |
+| Implement the Chat Completions driver callbacks and assemble its Finch request | `ReqLLM.Providers.OpenAI.ChatAPI` | `ReqLLM.Providers.OpenAI.ChatAPI` |
+| Build the exact request envelope used by both Req and Finch | private functions mixed into `ChatAPI` | <code>ReqLLM.Providers.OpenAI.ChatAPI.Request</code> |
+| Encode OpenAI-compatible messages and decode buffered/SSE wire data | `ReqLLM.Provider.Defaults` | `ReqLLM.Provider.Defaults` |
+| Accumulate chunks and materialize canonical responses | `ReqLLM.Provider.ChunkAccumulator` and response builders | unchanged shared modules |
+
+The request-envelope seam removes duplicate strict-tool and parallel-tool
+normalization by reusing `ReqLLM.Providers.OpenAI.AdapterHelpers`. SSE decoding,
+transport construction, and response handoff already have single owners, so they
+remain in place. This is an internal refactor: Req remains the buffered
+transport, Finch remains the streaming transport, and the existing
+`ReqLLM.Provider` callbacks and request/response shapes are preserved.
 
 ## Provider Options
 
@@ -271,7 +357,40 @@ ReqLLM also exposes an experimental low-level Realtime WebSocket client for sess
 :ok = ReqLLM.OpenAI.Realtime.close(session)
 ```
 
-This API is intentionally low-level. You send JSON events, receive JSON events, and manage the session lifecycle explicitly.
+This API is intentionally low-level. You send JSON events, receive JSON events, and manage the session lifecycle explicitly. Existing `next_event/2` calls continue to return the decoded OpenAI event unchanged.
+
+For consumers that already understand `ReqLLM.StreamEvent`, use the additive projected view:
+
+```elixir
+{:ok, projected} = ReqLLM.OpenAI.Realtime.next_projected_event(session)
+
+projected.type
+#=> "response.output_text.delta"
+
+projected.native
+#=> the native event with sensitive payloads redacted
+
+projected.stream_events
+#=> [%ReqLLM.StreamEvent{type: :text_delta, data: "[REDACTED]", ...}]
+```
+
+Pass `payloads: :raw` only when that consumer is authorized to retain text, audio transcripts, tool arguments/results, and provider error messages. Raw audio deltas, input transcription, session/control events, rate limits, MCP and other provider-native tools, and recoverable session errors remain native-only because ReqLLM has no exact portable event for them.
+
+The experimental projection is intentionally narrow:
+
+| OpenAI Realtime event | Portable projection |
+| --- | --- |
+| `response.created` | `:start` when the resolved session model is available |
+| `response.output_text.delta` | `:text_delta` |
+| `response.output_audio_transcript.delta` | `:text_delta` with `modality: :audio_transcript` |
+| application `response.output_item.added` | `:tool_call_start` |
+| `response.function_call_arguments.delta` / `.done` | `:tool_call_delta` / `:tool_call` |
+| application `conversation.item.done` function output | `:tool_result` |
+| `response.done` | optional `:usage`, then one `:finish`, `:cancelled`, or terminal `:error` |
+
+All other events have an empty `stream_events` list and remain available through `native`. This includes top-level `error` events because OpenAI defines many of them as recoverable session errors, while canonical `StreamEvent` errors are terminal. See the [OpenAI Realtime server-event reference](https://platform.openai.com/docs/api-reference/realtime-server-events) for the provider event catalog.
+
+`response.created` starts a canonical response lifecycle, and `response.done` contributes usage followed by exactly one completion, cancellation, or terminal error event. OpenAI event, response, item, call, conversation, session, index, and sequence identifiers are retained for correlation. Reconnecting creates a new provider session; ReqLLM does not hide reconnection or replay events. Applications or Jido continue to own session hosting, reconnection, tool execution, and follow-up calls.
 
 ## Usage Metrics
 
@@ -302,6 +421,186 @@ response.usage.cost
 ```
 
 Responses API server-side tools may also appear in `response.message.tool_calls` as builtin records (for example `web_search_call` or `file_search_call`). They are preserved for observability, but the provider already executed them: do not replay them as local tool calls. `ReqLLM.Response.classify/1` and `ReqLLM.StreamResponse.classify/1` treat builtin-only responses as final answers.
+
+### Citations
+
+When a model cites its sources — web search being the common case — the citations
+are retained as annotations and read back with `ReqLLM.Response.annotations/1`:
+
+```elixir
+{:ok, response} = ReqLLM.generate_text(
+  "openai:gpt-5-mini",
+  "Find one recent AI model announcement and cite the source.",
+  tools: [%{"type" => "web_search"}]
+)
+
+ReqLLM.Response.annotations(response)
+#=> [
+#=>   %{
+#=>     "type" => "url_citation",
+#=>     "url" => "https://example.com/announcement",
+#=>     "title" => "Example Announcement",
+#=>     "start_index" => 120,
+#=>     "end_index" => 168
+#=>   }
+#=> ]
+```
+
+`start_index` and `end_index` locate the citation inside `ReqLLM.Response.text/1`.
+The same list is available unprojected at `response.provider_meta["annotations"]`.
+
+Note that OpenAI usually points the span at an inline Markdown link it already wrote
+into the text, not at the prose the citation supports:
+
+```elixir
+text = ReqLLM.Response.text(response)
+String.slice(text, annotation["start_index"], annotation["end_index"] - annotation["start_index"])
+#=> "([example.com](https://example.com/announcement))"
+```
+
+So treat the span as "where this citation is already rendered" rather than "the
+claim to hyperlink" — wrapping it in another link would nest one link inside another.
+If you want your own citation markers, strip those Markdown links from the text and
+render footnotes from the annotation list instead.
+
+#### One shape across both API surfaces
+
+OpenAI's two API surfaces disagree on the wire format: Chat Completions nests the
+citation fields under a `"url_citation"` key, while the Responses API returns them
+flat. ReqLLM normalizes Chat Completions to the flat form, so consumers match one
+shape regardless of which surface a model uses:
+
+```
+Chat Completions, on the wire        What annotations/1 returns
+─────────────────────────────        ──────────────────────────
+%{"type" => "url_citation",          %{"type" => "url_citation",
+  "url_citation" => %{                 "url" => "https://…",
+    "url" => "https://…",       ──►    "title" => "…",
+    "title" => "…",                    "start_index" => 120,
+    "start_index" => 120,              "end_index" => 168}
+    "end_index" => 168}}
+```
+
+Annotation types that OpenAI already returns flat (`file_citation`, `file_path`,
+and others) pass through unchanged.
+
+The two surfaces also differ in how you *ask* for web search. The Responses API takes
+it as a tool; Chat Completions takes a `web_search_options` body field and serves it
+only on `*-search-preview` models:
+
+| | Responses API | Chat Completions |
+| --- | --- | --- |
+| Models | `gpt-5-mini`, `gpt-4o`, … | `gpt-4o-search-preview`, `gpt-4o-mini-search-preview` |
+| Enable with | `tools: [%{"type" => "web_search"}]` | `web_search_options: %{}` |
+| Citations on the wire | flat | nested under `"url_citation"` |
+
+```elixir
+{:ok, response} = ReqLLM.generate_text(
+  "openai:gpt-4o-mini-search-preview",
+  "Find one recent AI model announcement and cite the source.",
+  web_search_options: %{}
+)
+
+ReqLLM.Response.annotations(response)
+#=> flat url_citation maps, same as the Responses API
+```
+
+Pass `%{}` for OpenAI's defaults, or a configuration map such as
+`%{"search_context_size" => "high"}`. ReqLLM routes `*-search-preview` models to Chat
+Completions automatically, even though they share the `gpt-4o` prefix that otherwise
+selects the Responses API.
+
+#### Streaming
+
+Streaming needs no special handling — citations arrive incrementally and are
+accumulated for you, so the materialized response carries the full list:
+
+```elixir
+{:ok, stream_response} = ReqLLM.stream_text(
+  "openai:gpt-5-mini",
+  "Find one recent AI model announcement and cite the source.",
+  stream: true,
+  tools: [%{"type" => "web_search"}]
+)
+
+{:ok, response} = ReqLLM.StreamResponse.to_response(stream_response)
+ReqLLM.Response.annotations(response)
+#=> same list as the buffered call
+```
+
+To surface citations *during* the stream — to render footnotes as text arrives —
+consume `ReqLLM.StreamResponse.events/1` and watch for annotation output items:
+
+```elixir
+{:ok, stream_response} = ReqLLM.stream_text(
+  "openai:gpt-5-mini",
+  "Find one recent AI model announcement and cite the source.",
+  stream: true,
+  tools: [%{"type" => "web_search"}]
+)
+
+stream_response
+|> ReqLLM.StreamResponse.events()
+|> Stream.filter(&match?(%ReqLLM.StreamEvent{type: :output_item, data: %{type: :annotation}}, &1))
+|> Enum.each(fn event -> IO.inspect(event.data.data) end)
+```
+
+> #### Pick one consumer per stream {: .warning}
+>
+> A `StreamResponse` carries a single consumable stream, so `events/1`, `tokens/1`,
+> `to_response/1`, and the raw chunk stream are alternatives, not steps. Calling
+> `to_response/1` after draining `events/1` exits with `{:noproc, ...}` because the
+> stream is already spent. Each example above starts its own `stream_text/3` call
+> for that reason.
+>
+> To watch citations live *and* get the materialized response from one request, use
+> `ReqLLM.StreamResponse.process_stream/2`, which streams through your callbacks and
+> returns the final `Response`:
+>
+> ```elixir
+> {:ok, response} =
+>   ReqLLM.StreamResponse.process_stream(stream_response,
+>     on_meta: fn %ReqLLM.StreamChunk{metadata: meta} ->
+>       Enum.each(meta[:annotations] || [], &IO.inspect/1)
+>     end
+>   )
+>
+> ReqLLM.Response.annotations(response)
+> ```
+
+Each citation is emitted once. Providers that re-send a citation they already
+streamed, or that emit both incremental events and a final list, do not produce
+duplicates.
+
+#### Other OpenAI-format providers
+
+Citation normalization lives in the shared OpenAI-format decoders rather than in the
+OpenAI provider, so a provider inherits it by decoding through them — no
+per-provider work required. Providers that route both their buffered and streaming
+decode through the shared path get citations on both: Azure OpenAI, OpenRouter,
+Groq, MiniMax, ZenMux, Z.AI, Google Vertex (OpenAI-compatible endpoint), and xAI.
+
+Perplexity Sonar models routed through OpenRouter, for example, return nested
+`url_citation` annotations and read back through `ReqLLM.Response.annotations/1`
+in the same flat shape.
+
+The Responses API decoder is shared the same way, so Azure (Responses), OpenAI
+Codex, and Meta pick up annotations there. xAI is covered on both surfaces — it
+routes through the Responses API whenever built-in tools such as `web_search` or
+`x_search` are in play, and through Chat Completions otherwise.
+
+Some providers are covered only partially, because they hand-roll one half of their
+decoding:
+
+| Provider | Buffered | Streaming |
+| --- | --- | --- |
+| Amazon Bedrock (OpenAI models) | no — custom response parser | yes |
+| Google (OpenAI-compatible endpoint) | yes | no — native event decoder |
+
+Anthropic is not covered at all: it returns citations attached to its own content
+blocks rather than as OpenAI-style annotations. Google's native Gemini endpoints
+report grounding metadata through `ReqLLM.Response.sources/1`, a related but
+distinct channel.
 
 ### Code Interpreter (Responses API)
 

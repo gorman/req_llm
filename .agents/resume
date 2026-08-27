@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+command -v erl >/dev/null
+command -v mix >/dev/null
+
+echo "BEAM toolchain is available; this repository has no local services to resume."

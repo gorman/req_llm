@@ -57,7 +57,16 @@ defmodule ReqLLM.Error do
   defmodule API.Request do
     @moduledoc "Error for API request failures, HTTP errors, and network issues."
     use Splode.Error,
-      fields: [:reason, :status, :response_body, :request_body, :cause, :headers],
+      fields: [
+        :reason,
+        :status,
+        :response_body,
+        :request_body,
+        :cause,
+        :headers,
+        :provider_code,
+        :retryable
+      ],
       class: :api
 
     @spec message(map()) :: String.t()
@@ -145,6 +154,31 @@ defmodule ReqLLM.Error do
     @spec message(map()) :: String.t()
     def message(%{provider: provider}) do
       "Provider not implemented (metadata-only): #{provider}"
+    end
+  end
+
+  defmodule Invalid.ProviderFileReference do
+    @moduledoc "Error for an explicitly owned provider file used outside its lifecycle."
+    use Splode.Error,
+      fields: [:reason, :owner, :provider, :expires_at, :status],
+      class: :invalid
+
+    @typedoc "Validation error for an explicitly provider-owned file reference."
+    @type t() :: %__MODULE__{
+            reason: :provider_mismatch | :expired,
+            owner: String.t(),
+            provider: String.t(),
+            expires_at: String.t() | nil,
+            status: String.t() | nil
+          }
+
+    @spec message(t()) :: String.t()
+    def message(%{reason: :provider_mismatch, owner: owner, provider: provider}) do
+      "Owned provider file belongs to #{owner} and cannot be used with #{provider}"
+    end
+
+    def message(%{reason: :expired, owner: owner, expires_at: expires_at}) do
+      "Owned #{owner} provider file expired at #{expires_at}"
     end
   end
 
@@ -285,6 +319,39 @@ defmodule ReqLLM.Error do
     @spec message(map()) :: String.t()
     def message(%{reason: reason}) do
       reason
+    end
+  end
+
+  defmodule API.Timeout do
+    @moduledoc "Structured timeout for ReqLLM model calls and provider transports."
+    use Splode.Error,
+      fields: [:kind, :timeout],
+      class: :api
+
+    @typedoc "The phase whose configured timeout expired."
+    @type kind() :: :connect | :receive | :total | :stream_idle
+
+    @typedoc "Structured timeout with its phase and configured duration."
+    @type t() :: %__MODULE__{
+            kind: kind(),
+            timeout: pos_integer()
+          }
+
+    @spec message(t()) :: String.t()
+    def message(%{kind: :connect, timeout: timeout}) do
+      "Provider connection exceeded the timeout of #{timeout}ms"
+    end
+
+    def message(%{kind: :receive, timeout: timeout}) do
+      "Provider transport received no data for #{timeout}ms"
+    end
+
+    def message(%{kind: :total, timeout: timeout}) do
+      "Model call exceeded the total timeout of #{timeout}ms"
+    end
+
+    def message(%{kind: :stream_idle, timeout: timeout}) do
+      "Model stream made no semantic progress for #{timeout}ms"
     end
   end
 

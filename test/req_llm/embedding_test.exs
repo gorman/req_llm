@@ -12,7 +12,12 @@ defmodule ReqLLM.EmbeddingTest do
 
   use ExUnit.Case, async: true
 
+  @moduletag contract: :public_api
+
   alias ReqLLM.Embedding
+
+  defmodule SlowHTTP do
+  end
 
   defp setup_telemetry do
     test_pid = self()
@@ -142,6 +147,26 @@ defmodule ReqLLM.EmbeddingTest do
 
     test "rejects unsupported providers" do
       assert {:error, :unknown_provider} = Embedding.embed("unsupported:model", "Hello")
+    end
+
+    test "enforces the total timeout for non-generation model calls" do
+      Req.Test.stub(SlowHTTP, fn conn ->
+        Process.sleep(200)
+
+        Req.Test.json(conn, %{
+          "data" => [%{"embedding" => [0.1, 0.2], "index" => 0}],
+          "usage" => %{"prompt_tokens" => 1, "total_tokens" => 1}
+        })
+      end)
+
+      assert {:error, %ReqLLM.Error.API.Timeout{kind: :total, timeout: 50}} =
+               Embedding.embed(
+                 "openai:text-embedding-3-small",
+                 "Hello",
+                 api_key: "test-key",
+                 total_timeout: 50,
+                 req_http_options: [plug: {Req.Test, SlowHTTP}]
+               )
     end
   end
 
@@ -384,11 +409,11 @@ defmodule ReqLLM.EmbeddingTest do
     test "returns api request errors for non-success responses" do
       Req.Test.stub(__MODULE__.EmbeddingHTTPError, fn conn ->
         conn
-        |> Plug.Conn.put_status(429)
-        |> Req.Test.json(%{"error" => %{"message" => "rate limited"}})
+        |> Plug.Conn.put_status(422)
+        |> Req.Test.json(%{"error" => %{"message" => "invalid request"}})
       end)
 
-      assert {:error, %ReqLLM.Error.API.Request{status: 429, response_body: body}} =
+      assert {:error, %ReqLLM.Error.API.Request{status: 422, response_body: body}} =
                Embedding.embed(
                  "openai:text-embedding-3-small",
                  "Hello",
@@ -396,7 +421,7 @@ defmodule ReqLLM.EmbeddingTest do
                  req_http_options: [plug: {Req.Test, __MODULE__.EmbeddingHTTPError}]
                )
 
-      assert body == %{"error" => %{"message" => "rate limited"}}
+      assert body == %{"error" => %{"message" => "invalid request"}}
     end
 
     test "returns parse errors for malformed single embedding responses" do

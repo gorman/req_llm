@@ -111,7 +111,12 @@ defmodule ReqLLM.Providers.Anthropic.Context do
        })
        when is_list(tool_calls) and tool_calls != [] do
     thinking_blocks = encode_reasoning_details(reasoning_details)
-    text_blocks = encode_content(content)
+
+    text_blocks =
+      if thinking_blocks == [],
+        do: encode_content(content),
+        else: encode_non_thinking_content(content)
+
     tool_blocks = Enum.map(tool_calls, &encode_tool_call_to_tool_use/1)
 
     %{
@@ -127,11 +132,11 @@ defmodule ReqLLM.Providers.Anthropic.Context do
        })
        when is_list(reasoning_details) and reasoning_details != [] do
     thinking_blocks = encode_reasoning_details(reasoning_details)
-    text_blocks = encode_content(content)
+    content_blocks = encode_non_thinking_content(content)
 
     %{
       role: "assistant",
-      content: combine_all_content_blocks(thinking_blocks, text_blocks, [])
+      content: combine_all_content_blocks(thinking_blocks, content_blocks, [])
     }
   end
 
@@ -236,10 +241,58 @@ defmodule ReqLLM.Providers.Anthropic.Context do
 
   defp encode_content_part(_), do: nil
 
+  defp encode_non_thinking_content(content) when is_list(content) do
+    content
+    |> Enum.reject(&thinking_content_part?/1)
+    |> encode_content()
+  end
+
+  defp encode_non_thinking_content(content), do: encode_content(content)
+
+  defp thinking_content_part?(%ReqLLM.Message.ContentPart{type: :thinking}), do: true
+  defp thinking_content_part?(_part), do: false
+
   defp do_encode_content_part(%ReqLLM.Message.ContentPart{type: :text, text: ""}), do: nil
 
   defp do_encode_content_part(%ReqLLM.Message.ContentPart{type: :text, text: text}) do
     %{type: "text", text: text}
+  end
+
+  # A provider-native block decoded from an earlier Anthropic response
+  # (server_tool_use, web_search_tool_result, …) is re-sent verbatim — the
+  # provider guard keeps another provider's blocks out of an Anthropic request.
+  defp do_encode_content_part(%ReqLLM.Message.ContentPart{
+         type: :provider_block,
+         data: block,
+         metadata: %{provider: :anthropic}
+       })
+       when is_map(block) do
+    block
+  end
+
+  defp do_encode_content_part(%ReqLLM.Message.ContentPart{
+         type: :thinking,
+         metadata: %{"redacted" => true, "data" => data}
+       })
+       when is_binary(data) do
+    %{type: "redacted_thinking", data: data}
+  end
+
+  defp do_encode_content_part(%ReqLLM.Message.ContentPart{
+         type: :thinking,
+         metadata: %{redacted: true, data: data}
+       })
+       when is_binary(data) do
+    %{type: "redacted_thinking", data: data}
+  end
+
+  defp do_encode_content_part(%ReqLLM.Message.ContentPart{
+         type: :thinking,
+         text: text,
+         metadata: metadata
+       }) do
+    %{type: "thinking", thinking: text || ""}
+    |> maybe_put_signature(metadata)
   end
 
   defp do_encode_content_part(%ReqLLM.Message.ContentPart{
@@ -269,13 +322,33 @@ defmodule ReqLLM.Providers.Anthropic.Context do
     }
   end
 
+  # A file the code-execution tool should compute over is mounted into the
+  # container's filesystem instead of being read into the prompt. Given only a
+  # document block, the model's one route to running code over an uploaded file
+  # is to retype its whole content into the tool input.
+  #
+  # This clause must precede the general file clause below, which matches the
+  # same shape.
   defp do_encode_content_part(%ReqLLM.Message.ContentPart{
          type: :file,
          file_id: file_id,
-         media_type: media_type,
-         metadata: metadata
+         metadata: %{container_upload?: true}
        })
        when is_binary(file_id) and file_id != "" do
+    %{type: "container_upload", file_id: file_id}
+  end
+
+  defp do_encode_content_part(
+         %ReqLLM.Message.ContentPart{
+           type: :file,
+           file_id: legacy_file_id,
+           media_type: media_type,
+           metadata: metadata
+         } = part
+       )
+       when is_binary(legacy_file_id) and legacy_file_id != "" do
+    file_id = provider_file_id(part, :anthropic, legacy_file_id)
+
     %{
       type: file_block_type(media_type),
       source: %{
@@ -307,6 +380,13 @@ defmodule ReqLLM.Providers.Anthropic.Context do
 
   defp do_encode_content_part(_), do: nil
 
+  defp provider_file_id(part, provider, legacy_file_id) do
+    case ReqLLM.ProviderFileReference.reference_id(part, provider) do
+      {:ok, reference_id} -> reference_id
+      :error -> legacy_file_id
+    end
+  end
+
   # Honors an explicit cache breakpoint declared in ContentPart metadata as
   # `%{cache_control: %{type: "ephemeral"}}` (or with `"ttl" => "1h"`). Accepts
   # atom or string `cache_control` keys; leaves the block untouched when absent.
@@ -319,6 +399,14 @@ defmodule ReqLLM.Providers.Anthropic.Context do
        do: Map.put(block, :cache_control, cache_control)
 
   defp maybe_put_cache_control(block, _metadata), do: block
+
+  defp maybe_put_signature(block, %{signature: signature}) when is_binary(signature),
+    do: Map.put(block, :signature, signature)
+
+  defp maybe_put_signature(block, %{"signature" => signature}) when is_binary(signature),
+    do: Map.put(block, :signature, signature)
+
+  defp maybe_put_signature(block, _metadata), do: block
 
   defp file_block_type(media_type) when is_binary(media_type) do
     if String.starts_with?(media_type, "image/"), do: "image", else: "document"
@@ -363,9 +451,17 @@ defmodule ReqLLM.Providers.Anthropic.Context do
   defp decode_tool_arguments(args) when is_map(args), do: args
   defp decode_tool_arguments(nil), do: %{}
 
+  # When the decoded content already carries its thinking blocks positionally
+  # (as provider blocks), prepending the `reasoning_details` copies would both
+  # duplicate them and move them ahead of the server-tool blocks they followed —
+  # which Anthropic rejects as a modified thinking block. Content order wins.
   defp combine_all_content_blocks(thinking_blocks, text_blocks, tool_blocks)
        when is_list(text_blocks) do
-    thinking_blocks ++ text_blocks ++ tool_blocks
+    if Enum.any?(text_blocks, &thinking_block?/1) do
+      text_blocks ++ tool_blocks
+    else
+      thinking_blocks ++ text_blocks ++ tool_blocks
+    end
   end
 
   defp combine_all_content_blocks(thinking_blocks, "", tool_blocks) do
@@ -377,6 +473,12 @@ defmodule ReqLLM.Providers.Anthropic.Context do
     thinking_blocks ++ [%{type: "text", text: text_string}] ++ tool_blocks
   end
 
+  # Accepts either key convention: thinking blocks are atom-keyed, but a block
+  # replayed verbatim from a decoded response could arrive string-keyed.
+  defp thinking_block?(%{type: "thinking"}), do: true
+  defp thinking_block?(%{"type" => "thinking"}), do: true
+  defp thinking_block?(_), do: false
+
   defp encode_reasoning_details(nil), do: []
   defp encode_reasoning_details([]), do: []
 
@@ -387,11 +489,18 @@ defmodule ReqLLM.Providers.Anthropic.Context do
   end
 
   defp encode_single_reasoning_detail(
+         %ReqLLM.Message.ReasoningDetails{provider: :anthropic, encrypted?: true} = detail
+       ) do
+    case redacted_reasoning_data(detail) do
+      nil -> encode_anthropic_thinking_detail(detail)
+      data -> [%{type: "redacted_thinking", data: data}]
+    end
+  end
+
+  defp encode_single_reasoning_detail(
          %ReqLLM.Message.ReasoningDetails{provider: :anthropic} = detail
        ) do
-    block = %{type: "thinking", thinking: detail.text || ""}
-    block = if detail.signature, do: Map.put(block, :signature, detail.signature), else: block
-    [block]
+    encode_anthropic_thinking_detail(detail)
   end
 
   defp encode_single_reasoning_detail(%ReqLLM.Message.ReasoningDetails{provider: provider}) do
@@ -400,6 +509,19 @@ defmodule ReqLLM.Providers.Anthropic.Context do
   end
 
   defp encode_single_reasoning_detail(_), do: []
+
+  defp encode_anthropic_thinking_detail(detail) do
+    block = %{type: "thinking", thinking: detail.text || ""}
+    block = if detail.signature, do: Map.put(block, :signature, detail.signature), else: block
+    [block]
+  end
+
+  defp redacted_reasoning_data(%ReqLLM.Message.ReasoningDetails{provider_data: provider_data})
+       when is_map(provider_data) do
+    Map.get(provider_data, :data) || Map.get(provider_data, "data")
+  end
+
+  defp redacted_reasoning_data(_detail), do: nil
 
   defp encode_tool_result_content(%ReqLLM.Message{content: content} = msg) do
     output = ReqLLM.ToolResult.output_from_message(msg)

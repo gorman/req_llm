@@ -1,6 +1,9 @@
 defmodule ReqLLM.Response.StreamTest do
   use ExUnit.Case, async: true
 
+  @moduletag contract: :public_api
+
+  alias ReqLLM.Message.ContentPart
   alias ReqLLM.Response.Stream, as: ResponseStream
   alias ReqLLM.StreamChunk
 
@@ -28,6 +31,13 @@ defmodule ReqLLM.Response.StreamTest do
 
       assert summary.thinking == "Let me think... about this."
       assert summary.text == "Here's my answer."
+    end
+
+    test "accumulates complete multimodal content parts" do
+      image = ContentPart.image(<<1, 2, 3>>, "image/png")
+      summary = ResponseStream.summarize([StreamChunk.content_part(image)])
+
+      assert summary.content_parts == [image]
     end
 
     test "reconstructs tool calls from fragments" do

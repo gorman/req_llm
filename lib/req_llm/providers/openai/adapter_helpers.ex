@@ -128,6 +128,19 @@ defmodule ReqLLM.Providers.OpenAI.AdapterHelpers do
     |> maybe_recurse_defs()
   end
 
+  def enforce_strict_recursive(%{"type" => "object", "patternProperties" => patterns} = schema)
+      when is_map(patterns) do
+    updated_patterns =
+      Map.new(patterns, fn {k, v} -> {k, enforce_strict_recursive(v)} end)
+
+    schema
+    |> Map.put("patternProperties", updated_patterns)
+    |> Map.put_new("properties", %{})
+    |> Map.put("required", [])
+    |> Map.put("additionalProperties", false)
+    |> maybe_recurse_defs()
+  end
+
   def enforce_strict_recursive(%{"type" => "array", "items" => items} = schema)
       when is_map(items) do
     Map.put(schema, "items", enforce_strict_recursive(items))
@@ -141,7 +154,32 @@ defmodule ReqLLM.Providers.OpenAI.AdapterHelpers do
     Map.put(schema, "oneOf", Enum.map(variants, &enforce_strict_recursive/1))
   end
 
+  def enforce_strict_recursive(%{} = schema) do
+    if annotation_only_schema?(schema) do
+      schema
+      |> Map.put("type", "object")
+      |> Map.put("properties", %{})
+      |> Map.put("required", [])
+      |> Map.put("additionalProperties", false)
+      |> maybe_recurse_defs()
+    else
+      schema
+    end
+  end
+
   def enforce_strict_recursive(schema), do: schema
+
+  # Annotation-only schemas such as %{"description" => "..."} are valid JSON Schema
+  # unrestricted subschemas, but OpenAI strict tool schemas reject subschemas without an
+  # assertion/applicator keyword. In strict OpenAI mode, represent them as empty strict objects.
+  @schema_shape_keys ["type", "anyOf", "oneOf", "allOf", "$ref", "const", "enum"]
+  @annotation_keys ["description", "title", "default", "examples"]
+
+  defp annotation_only_schema?(schema) do
+    map_size(schema) > 0 and
+      not Enum.any?(@schema_shape_keys, &Map.has_key?(schema, &1)) and
+      Enum.all?(Map.keys(schema), &(&1 in @annotation_keys))
+  end
 
   defp maybe_recurse_defs(%{"$defs" => defs} = schema) when is_map(defs) do
     updated_defs = Map.new(defs, fn {k, v} -> {k, enforce_strict_recursive(v)} end)
@@ -155,13 +193,29 @@ defmodule ReqLLM.Providers.OpenAI.AdapterHelpers do
 
   This includes reasoning/codex families plus GPT-4.1 and GPT-4o models, which
   support Responses even when older metadata has not been updated yet.
+
+  Search-preview models are excluded: OpenAI serves them only on Chat
+  Completions, so inferring Responses for them yields a 404.
   """
   @spec responses_model?(term()) :: boolean()
   def responses_model?(model_id) when is_binary(model_id) do
-    reasoning_model?(model_id) || gpt41_model?(model_id) || gpt4o_model?(model_id)
+    not search_preview_model?(model_id) and
+      (reasoning_model?(model_id) || gpt41_model?(model_id) || gpt4o_model?(model_id))
   end
 
   def responses_model?(_), do: false
+
+  @doc """
+  Checks if a model ID is an OpenAI `*-search-preview` model.
+
+  These models are Chat Completions only, and enable web search through the
+  `web_search_options` body field rather than a tool entry.
+  """
+  @spec search_preview_model?(term()) :: boolean()
+  def search_preview_model?(model_id) when is_binary(model_id),
+    do: String.contains?(model_id, "search-preview")
+
+  def search_preview_model?(_), do: false
 
   @doc """
   Checks if a model ID corresponds to an OpenAI reasoning model.
@@ -268,7 +322,8 @@ defmodule ReqLLM.Providers.OpenAI.AdapterHelpers do
   Adds response_format to the request body with schema normalization.
 
   Handles json_schema response formats by converting ReqLLM schema DSL
-  to JSON Schema format. Supports both atom and string key maps.
+  to JSON Schema format and enforcing strict OpenAI JSON Schema requirements
+  when `strict: true` is set. Supports both atom and string key maps.
   """
   @spec add_response_format(map(), keyword()) :: map()
   def add_response_format(body, provider_opts) do
@@ -276,8 +331,31 @@ defmodule ReqLLM.Providers.OpenAI.AdapterHelpers do
 
     normalized =
       case response_format do
+        %{type: "json_schema", json_schema: %{schema: schema, strict: true}} = m
+        when is_list(schema) ->
+          put_in(
+            m,
+            [:json_schema, :schema],
+            schema |> ReqLLM.Schema.to_json() |> enforce_strict_recursive()
+          )
+
         %{type: "json_schema", json_schema: %{schema: schema}} = m when is_list(schema) ->
           put_in(m, [:json_schema, :schema], ReqLLM.Schema.to_json(schema))
+
+        %{
+          "type" => "json_schema",
+          "json_schema" => %{"strict" => true, "schema" => schema} = json_schema
+        } = m
+        when is_list(schema) ->
+          schema = schema |> ReqLLM.Schema.to_json() |> enforce_strict_recursive()
+          %{m | "json_schema" => Map.put(json_schema, "schema", schema)}
+
+        %{
+          "type" => "json_schema",
+          "json_schema" => %{"strict" => true, "schema" => schema} = json_schema
+        } = m
+        when is_map(schema) ->
+          %{m | "json_schema" => Map.put(json_schema, "schema", enforce_strict_recursive(schema))}
 
         %{"type" => "json_schema", "json_schema" => %{"schema" => schema}} = m
         when is_list(schema) ->

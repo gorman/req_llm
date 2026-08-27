@@ -38,6 +38,28 @@ defmodule ReqLLM.Provider.ChunkAccumulatorTest do
     end
   end
 
+  describe "finalize_ordered_content/2" do
+    test "keeps images before and between merged text parts" do
+      first_image = ContentPart.image(<<1>>, "image/png")
+      second_image = ContentPart.image(<<2>>, "image/png")
+
+      acc =
+        ChunkAccumulator.new()
+        |> ChunkAccumulator.push(StreamChunk.content_part(first_image))
+        |> ChunkAccumulator.push(StreamChunk.text("First "))
+        |> ChunkAccumulator.push(StreamChunk.text("caption"))
+        |> ChunkAccumulator.push(StreamChunk.content_part(second_image))
+        |> ChunkAccumulator.push(StreamChunk.text("Second caption"))
+
+      assert ChunkAccumulator.finalize_ordered_content(acc) == [
+               first_image,
+               ContentPart.text("First caption"),
+               second_image,
+               ContentPart.text("Second caption")
+             ]
+    end
+  end
+
   describe "push/2 - tool calls" do
     test "captures tool call with provider-supplied id" do
       acc =
@@ -155,9 +177,62 @@ defmodule ReqLLM.Provider.ChunkAccumulatorTest do
 
       assert ChunkAccumulator.finalize_logprobs(acc) == [%{token: "a"}, %{token: "b"}]
     end
+
+    test "collects annotations across meta chunks in arrival order" do
+      acc =
+        ChunkAccumulator.new()
+        |> ChunkAccumulator.push(%StreamChunk{type: :meta, metadata: %{annotations: [%{n: 1}]}})
+        |> ChunkAccumulator.push(%StreamChunk{type: :meta, metadata: %{annotations: [%{n: 2}]}})
+        |> ChunkAccumulator.push(%StreamChunk{type: :meta, metadata: %{finish_reason: "stop"}})
+
+      assert ChunkAccumulator.finalize_annotations(acc) == [%{n: 1}, %{n: 2}]
+    end
+
+    test "drops exact duplicate annotations while preserving order" do
+      acc =
+        ChunkAccumulator.new()
+        |> ChunkAccumulator.push(%StreamChunk{type: :meta, metadata: %{annotations: [%{n: 1}]}})
+        |> ChunkAccumulator.push(%StreamChunk{
+          type: :meta,
+          metadata: %{annotations: [%{n: 2}, %{n: 1}]}
+        })
+
+      assert ChunkAccumulator.finalize_annotations(acc) == [%{n: 1}, %{n: 2}]
+    end
+
+    test "ignores meta chunks without annotations" do
+      acc =
+        ChunkAccumulator.new()
+        |> ChunkAccumulator.push(%StreamChunk{type: :meta, metadata: %{finish_reason: "stop"}})
+
+      assert ChunkAccumulator.finalize_annotations(acc) == []
+    end
   end
 
   describe "finalize_tool_calls_for_response/1" do
+    test "reconstructs args when the first chunk carries the opening brace (llama.cpp/vLLM)" do
+      acc =
+        ChunkAccumulator.new()
+        |> ChunkAccumulator.push(%StreamChunk{
+          type: :tool_call,
+          name: "get_weather",
+          arguments: %{},
+          metadata: %{id: "call_1", index: 0, raw_arguments: "{", invalid_arguments: true}
+        })
+        |> ChunkAccumulator.push(%StreamChunk{
+          type: :meta,
+          metadata: %{tool_call_args: %{index: 0, fragment: "\"city\":\"NYC\""}}
+        })
+        |> ChunkAccumulator.push(%StreamChunk{
+          type: :meta,
+          metadata: %{tool_call_args: %{index: 0, fragment: "}"}}
+        })
+
+      assert [
+               %{id: "call_1", name: "get_weather", arguments: %{"city" => "NYC"}}
+             ] = ChunkAccumulator.finalize_tool_calls_for_response(acc)
+    end
+
     test "decodes argument fragments and drops :index" do
       acc =
         ChunkAccumulator.new()
@@ -245,7 +320,7 @@ defmodule ReqLLM.Provider.ChunkAccumulatorTest do
                ChunkAccumulator.finalize_tool_calls_for_response(acc)
 
       refute Map.has_key?(tool_call, :metadata)
-      refute_receive {:args_lost, "call_direct_args", _, _}
+      refute_received {:args_lost, "call_direct_args", _, _}
     end
 
     test "preserves non-control tool metadata" do
@@ -320,7 +395,44 @@ defmodule ReqLLM.Provider.ChunkAccumulatorTest do
                ChunkAccumulator.finalize_tool_calls_for_response(acc)
 
       refute Map.has_key?(tool_call, :metadata)
-      refute_receive {:args_lost, "call_empty_fragments", _, _}
+      refute_received {:args_lost, "call_empty_fragments", _, _}
+    end
+
+    test "zero fragments on a completed block means empty args, not args_lost" do
+      attach_args_lost_handler("call_empty_args")
+
+      acc =
+        ChunkAccumulator.new()
+        |> ChunkAccumulator.push(%StreamChunk{
+          type: :tool_call,
+          name: "list_channels",
+          arguments: %{},
+          metadata: %{id: "call_empty_args", index: 0, start: true}
+        })
+        |> ChunkAccumulator.push(StreamChunk.meta(%{tool_call_complete: 0}))
+
+      assert [call] = ChunkAccumulator.finalize_tool_calls_for_response(acc)
+      assert call.arguments == %{}
+      refute match?(%{metadata: %{error: _}}, call)
+
+      refute_receive {:args_lost, "call_empty_args", _, _}
+    end
+
+    test "a completed block elsewhere does not vouch for a different index" do
+      attach_args_lost_handler("call_other_index")
+
+      acc =
+        ChunkAccumulator.new()
+        |> ChunkAccumulator.push(%StreamChunk{
+          type: :tool_call,
+          name: "get_weather",
+          arguments: %{},
+          metadata: %{id: "call_other_index", index: 1, start: true}
+        })
+        |> ChunkAccumulator.push(StreamChunk.meta(%{tool_call_complete: 0}))
+
+      assert [%{metadata: %{error: {:args_lost, :missing_fragments}}}] =
+               ChunkAccumulator.finalize_tool_calls_for_response(acc)
     end
 
     test "returns [] for empty accumulator" do
@@ -346,6 +458,22 @@ defmodule ReqLLM.Provider.ChunkAccumulatorTest do
              } = ChunkAccumulator.finalize_message(acc)
     end
 
+    test "builds an assistant message with generated image content" do
+      image = ContentPart.image(<<1, 2, 3>>, "image/png")
+
+      acc =
+        ChunkAccumulator.new()
+        |> ChunkAccumulator.push(StreamChunk.content_part(image))
+
+      assert ChunkAccumulator.finalize_content_parts(acc) == [image]
+
+      assert %Message{
+               role: :assistant,
+               content: [^image],
+               tool_calls: nil
+             } = ChunkAccumulator.finalize_message(acc)
+    end
+
     test "builds assistant message with tool calls as ToolCall structs" do
       acc =
         ChunkAccumulator.new()
@@ -365,6 +493,29 @@ defmodule ReqLLM.Provider.ChunkAccumulatorTest do
 
       assert %ToolCall{id: "call_1", function: %{name: "get_weather"}} = tool_call
       refute ToolCall.builtin?(tool_call)
+    end
+
+    test "reconstructs tool call args from raw leading argument fragments" do
+      acc =
+        ChunkAccumulator.new()
+        |> ChunkAccumulator.push(%StreamChunk{
+          type: :tool_call,
+          name: "get_weather",
+          arguments: %{},
+          metadata: %{id: "call_1", index: 0, raw_arguments: "{", invalid_arguments: true}
+        })
+        |> ChunkAccumulator.push(%StreamChunk{
+          type: :meta,
+          metadata: %{tool_call_args: %{index: 0, fragment: "\"city\":\"NYC\""}}
+        })
+        |> ChunkAccumulator.push(%StreamChunk{
+          type: :meta,
+          metadata: %{tool_call_args: %{index: 0, fragment: "}"}}
+        })
+
+      assert %Message{tool_calls: [tool_call]} = ChunkAccumulator.finalize_message(acc)
+      assert %ToolCall{function: %{arguments: arguments}} = tool_call
+      assert Jason.decode!(arguments) == %{"city" => "NYC"}
     end
 
     test "preserves builtin flag on emitted ToolCall struct" do

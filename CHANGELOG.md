@@ -9,6 +9,209 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- changelog -->
 
+## [v1.21.0](https://github.com/agentjido/req_llm/compare/v1.20.0...v1.21.0) (2026-08-23)
+
+
+
+
+### Features:
+
+* google: accept base_url, receive_timeout, and req_http_options in CachedContent (#970) by Aaron Renner
+
+* ollama: forward reasoning_effort to disable thinking on reasoning models by David Bluestein II
+
+* OpenAI (and compatible providers) web search citations (#964) by Vasilis Spilka
+
+* minimax: add video generation support (#961) by Gilbert
+
+* Azure image support (#956) by Vasilis Spilka
+
+### Bug Fixes:
+
+* test: stabilize llm db release fixture (#968) by mikehostetler
+
+* treat llm_db as a regular OTP dependency (#963) by mikehostetler
+
+* OpenAI cost per image (#957) by Vasilis Spilka
+
+* streaming: fall back after oversized websocket messages (#958) by Danila Poyarkov
+
+## [v1.20.0](https://github.com/agentjido/req_llm/compare/v1.19.0...v1.20.0) (2026-08-10)
+
+
+
+
+### Features:
+
+* add unverified model warning configuration (#954) by anagrius
+
+### Bug Fixes:
+
+* use current Req Finch options (#952) by mikehostetler
+
+## [v1.19.0](https://github.com/agentjido/req_llm/compare/v1.18.0...v1.19.0) (2026-08-04)
+
+
+
+
+### Features:
+
+* google_vertex: support multi-region (us/eu) endpoints (#948) by matija-workera
+
+* openrouter: forward Google safety settings to Gemini models (#947) by Gilles Dubuc
+
+### Bug Fixes:
+
+* minimax: preserve normalized streaming reasoning details (#943) by Oliver Grüttner
+
+* google: stop reporting non-streaming aborts as a clean stop (#945) by Gilles Dubuc
+
+* remove deleted roadmap references by mikehostetler
+
+## [v1.18.0](https://github.com/agentjido/req_llm/compare/v1.17.1...v1.18.0) (2026-07-31)
+
+
+
+
+### Features:
+
+* openai: support explicit cache breakpoints (#942) by mikehostetler
+
+* minimax: add image generation support (#919) by Gilbert
+
+* providers: add Moonshot AI Kimi K3 support by mikehostetler
+
+* reasoning: support max effort by Danila Poyarkov
+
+* add speech call metadata by mikehostetler
+
+* add transcription call metadata by mikehostetler
+
+* add OpenAI file uploads by mikehostetler
+
+* add owned provider file references (#908) by mikehostetler
+
+* add the V2 migration audit (#907) by mikehostetler
+
+* add ReqLLM environment diagnostics by mikehostetler
+
+* stabilize ReqLLM runtime telemetry by mikehostetler
+
+* meta: add Meta Model API provider (#902) by mikehostetler
+
+* openai_codex: support Responses Lite models (#897) by Danila Poyarkov
+
+* add tool context continuation helpers (#899) by mikehostetler
+
+* harden canonical tool exchange contracts (#898) by mikehostetler
+
+* add visible structured output validation policies by mikehostetler
+
+* add structured output contracts (#895) by mikehostetler
+
+* add model call timeout budgets by mikehostetler
+
+* add canonical stream event projections by mikehostetler
+
+* add model call projections by mikehostetler
+
+* add namespaced provider options by mikehostetler
+
+* add execution plan inspection by mikehostetler
+
+* add evidence-backed model support tiers by mikehostetler
+
+* add Anthropic OAuth token refresh (#809) by Alexander Arellano
+
+### Bug Fixes:
+
+* streaming: surface empty-body HTTP failures (#941) by mikehostetler
+
+* google: map Gemini policy stops to content_filter by Gilles Dubuc
+
+* google: preserve raw Gemini finish reason and message by Gilles Dubuc
+
+* openrouter: retain generated chat images by mikehostetler
+
+* google,bedrock: route non-streaming requests to the configured Finch pool (#932) by Gilles Dubuc
+
+* openai: encode canonical Responses tool choice (#926) by Danila Poyarkov
+
+* streaming: separate WebSocket timeout phases (#930) by Danila Poyarkov
+
+* google: avoid duplicate tool result text (#925) by mikehostetler
+
+* openrouter: encode PDFs as file inputs (#923) by mikehostetler
+
+* harden OCR operation observability (#914) by mikehostetler
+
+* harden canonical reasoning options by mikehostetler
+
+* handle tuple model specification options (#875) by mikehostetler
+
+* deps: update Mint for CVE-2026-59249 by mikehostetler
+
+* streaming: classify terminal failures (#827) by mikehostetler
+
+* streaming: terminate metadata handles (#825) by mikehostetler
+
+* preserve Anthropic thinking signatures with tool calls (#810) by Alexander Arellano
+
+* streaming: enforce high-watermark backpressure (#823) by mikehostetler
+
+* streaming: finalize metadata lifecycle (#820) by mikehostetler
+
+* retry: honor caller retry limits (#819) by mikehostetler
+
+* oauth: serialize and atomically persist refreshes (#818) by mikehostetler
+
+* deps: update mint to 1.9.2 (#822) by mikehostetler
+
+### Refactoring:
+
+* normalize OpenAI realtime events (#915) by mikehostetler
+
+* separate OpenAI Chat Completions provider seams by mikehostetler
+
+* share Anthropic Messages materialization (#892) by mikehostetler
+
+* share OpenAI Responses materialization (#891) by mikehostetler
+
+* share OpenAI Chat Completions result materialization by mikehostetler
+
+* plan Anthropic Messages requests by mikehostetler
+
+* plan OpenAI text requests by mikehostetler
+
+* add internal request planning by mikehostetler
+
+* centralize compatibility scenario metadata by mikehostetler
+
+## [v1.17.1](https://github.com/agentjido/req_llm/compare/v1.17.0...v1.17.1) (2026-07-06)
+
+
+
+
+### Bug Fixes:
+
+* openrouter: preserve reasoning details by Danila Poyarkov
+
+* openrouter: encode audio files as input_audio by mikehostetler
+
+* clarify tool call response contract by mikehostetler
+
+* make goth and ex_aws_auth optional dependencies by Dave Lucia
+
+* keys: support default options for get by schwarz
+
+* streaming: preserve leading tool call argument fragments by anagrius
+
+* retry transport errors wrapped in ReqLLM.Error.API.Request by mark-a-12
+
+* ollama: streaming provider also sent an empty request body by cash-mckeeman
+
+* context: encode provider-specific content blocks by Danila Poyarkov
+
 ## [v1.17.0](https://github.com/agentjido/req_llm/compare/v1.16.0...v1.17.0) (2026-06-26)
 
 

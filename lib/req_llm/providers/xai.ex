@@ -243,9 +243,8 @@ defmodule ReqLLM.Providers.XAI do
           [
             url: path,
             method: :post,
-            receive_timeout: timeout,
-            pool_timeout: timeout
-          ] ++ http_opts
+            receive_timeout: timeout
+          ] ++ ReqLLM.Provider.Defaults.merge_finch_options(http_opts, pool_timeout: timeout)
         )
         |> Req.Request.register_options(req_keys)
         |> Req.Request.merge_options(
@@ -762,10 +761,7 @@ defmodule ReqLLM.Providers.XAI do
   end
 
   def pre_validate_options(_operation, _model, opts) do
-    case Keyword.fetch(opts, :reasoning_effort) do
-      {:ok, effort} -> Keyword.put(opts, :reasoning_effort, normalize_reasoning_effort(effort))
-      :error -> opts
-    end
+    ReqLLM.Provider.Reasoning.normalize_effort_option(opts)
   end
 
   @impl ReqLLM.Provider
@@ -862,15 +858,6 @@ defmodule ReqLLM.Providers.XAI do
   defp reasoning_effort_supported?(%{id: "grok-4-1-fast" <> _}), do: true
   defp reasoning_effort_supported?(%{id: "grok-4" <> _}), do: true
   defp reasoning_effort_supported?(_), do: false
-
-  defp normalize_reasoning_effort("none"), do: :none
-  defp normalize_reasoning_effort("minimal"), do: :minimal
-  defp normalize_reasoning_effort("low"), do: :low
-  defp normalize_reasoning_effort("medium"), do: :medium
-  defp normalize_reasoning_effort("high"), do: :high
-  defp normalize_reasoning_effort("xhigh"), do: :xhigh
-  defp normalize_reasoning_effort("default"), do: :default
-  defp normalize_reasoning_effort(value), do: value
 
   defp drop_image_unsupported(opts, explicit_keys) do
     unsupported_params = [:size, :output_format, :quality, :style, :negative_prompt, :seed, :user]

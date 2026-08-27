@@ -14,23 +14,26 @@ defmodule ReqLLM.Telemetry do
   | Event                                | Measurements                   |
   |--------------------------------------|--------------------------------|
   | `[:req_llm, :request, :start]`       | `system_time`                  |
+  | `[:req_llm, :request, :retry]`       | `duration`, `system_time`      |
   | `[:req_llm, :request, :stop]`        | `duration`, `system_time`      |
   | `[:req_llm, :request, :exception]`   | `duration`, `system_time`      |
   | `[:req_llm, :reasoning, :start]`     | `system_time`                  |
   | `[:req_llm, :reasoning, :update]`    | `system_time`                  |
   | `[:req_llm, :reasoning, :stop]`      | `duration`, `system_time`      |
   | `[:req_llm, :token_usage]`           | token + cost counters          |
+  | `[:req_llm, :tool_call_args_lost]`   | `count`                        |
 
   `duration` is in native monotonic time units — convert with
   `System.convert_time_unit/3` if you want milliseconds.
 
   ## Request metadata
 
-  All request lifecycle events carry the same metadata map: `request_id`,
+  All request lifecycle events carry the same base metadata map: `request_id`,
   `operation`, `mode`, `provider`, `model`, `transport`, `reasoning`,
   `request_summary`, `response_summary`, `http_status`, `finish_reason`,
-  `usage`, `request_options`, `server`, `streaming`. The full shape and a
-  worked example live in the [Telemetry guide](https://hexdocs.pm/req_llm/telemetry.html).
+  `usage`, `request_options`, `server`, `request_started_system_time`.
+  Streaming requests additionally carry `streaming`. The full shape and a worked
+  example live in the [Telemetry guide](https://hexdocs.pm/req_llm/telemetry.html).
 
   Reasoning events never include raw thinking text — they are metadata-only
   even with payload capture enabled.
@@ -58,6 +61,8 @@ defmodule ReqLLM.Telemetry do
 
   - [Telemetry guide](https://hexdocs.pm/req_llm/telemetry.html) — full event
     shapes, reasoning normalization, payload capture, attach examples
+  - [V1 telemetry contract](https://hexdocs.pm/req_llm/telemetry-contract.html) —
+    stability, units, redaction, and complete event inventory
   - `ReqLLM.OpenTelemetry` — the auto-attached GenAI client span bridge
   - `ReqLLM.Telemetry.OpenTelemetry` — dependency-free OTel mapper
   """
@@ -73,11 +78,30 @@ defmodule ReqLLM.Telemetry do
   @request_context_key :req_llm_telemetry
   @token_usage_event [:req_llm, :token_usage]
   @request_start_event [:req_llm, :request, :start]
+  @request_retry_event [:req_llm, :request, :retry]
   @request_stop_event [:req_llm, :request, :stop]
   @request_exception_event [:req_llm, :request, :exception]
   @reasoning_start_event [:req_llm, :reasoning, :start]
   @reasoning_update_event [:req_llm, :reasoning, :update]
   @reasoning_stop_event [:req_llm, :reasoning, :stop]
+  @tool_call_args_lost_event [:req_llm, :tool_call_args_lost]
+
+  @stable_events [
+    @request_start_event,
+    @request_stop_event,
+    @request_exception_event,
+    @token_usage_event
+  ]
+
+  @experimental_events [
+    @request_retry_event,
+    @reasoning_start_event,
+    @reasoning_update_event,
+    @reasoning_stop_event,
+    @tool_call_args_lost_event
+  ]
+
+  @events @stable_events ++ @experimental_events
 
   @type payload_mode :: :none | :raw
   @type lifecycle_mode :: :sync | :stream
@@ -94,7 +118,7 @@ defmodule ReqLLM.Telemetry do
           | :unsupported
 
   @reasoning_operations [:chat, :object]
-  @canonical_reasoning_efforts [:minimal, :low, :medium, :high, :xhigh, :default]
+  @canonical_reasoning_efforts [:minimal, :low, :medium, :high, :xhigh, :max, :default]
   @openai_reasoning_providers [:openai, :groq, :openrouter, :xai]
   @thinking_toggle_providers [:zai, :zai_coder]
   @alibaba_providers [:alibaba, :alibaba_cn]
@@ -124,6 +148,33 @@ defmodule ReqLLM.Telemetry do
           reasoning_observation: map(),
           response_summary_state: map()
         }
+
+  @doc """
+  Returns every native telemetry event emitted by ReqLLM V1.
+
+  Use `stable_events/0` when attaching a long-lived integration. The remaining
+  events are included here so diagnostic tooling can attach without maintaining
+  a duplicate inventory.
+  """
+  @spec events() :: [[atom()]]
+  def events, do: @events
+
+  @doc """
+  Returns the V1 stable telemetry core.
+
+  This includes request lifecycle events and the backwards-compatible token
+  usage event. Stream first-output timing is carried by request lifecycle
+  metadata rather than a separate event.
+  """
+  @spec stable_events() :: [[atom()]]
+  def stable_events, do: @stable_events
+
+  @doc """
+  Returns events that remain available in V1 but whose detailed shape is
+  experimental.
+  """
+  @spec experimental_events() :: [[atom()]]
+  def experimental_events, do: @experimental_events
 
   @doc """
   Returns the private key used to store telemetry context on Req requests.
@@ -249,6 +300,33 @@ defmodule ReqLLM.Telemetry do
     else
       context
     end
+  end
+
+  @doc false
+  @spec retry_request(context() | nil, map()) :: :ok
+  def retry_request(nil, _retry), do: :ok
+
+  def retry_request(context, retry) do
+    duration = Map.get(retry, :duration, 0)
+
+    metadata =
+      context
+      |> request_metadata(%{
+        http_status: Map.get(retry, :http_status),
+        finish_reason: nil,
+        usage: nil,
+        response_summary: response_summary(context.response_summary_state, context.operation),
+        response_payload: nil
+      })
+      |> Map.put(:retry, Map.delete(retry, :duration))
+
+    :telemetry.execute(
+      @request_retry_event,
+      %{duration: duration, system_time: System.system_time()},
+      metadata
+    )
+
+    :ok
   end
 
   @doc """
@@ -386,24 +464,41 @@ defmodule ReqLLM.Telemetry do
 
   def exception_request(%{request_stopped?: true} = context, _error, _opts), do: context
 
-  def exception_request(context, error, _opts) do
+  def exception_request(context, error, opts) do
     context = ensure_started(context, context.original_opts)
-    context = observe_error_reasoning(context, error)
+    usage = Keyword.get(opts, :usage)
+
+    context =
+      context
+      |> observe_error_reasoning(error)
+      |> observe_reasoning_usage(usage)
 
     :telemetry.execute(
       @request_exception_event,
       stop_measurements(context),
       request_metadata(context, %{
-        http_status: http_status_from_error(error),
+        http_status: Keyword.get(opts, :http_status) || http_status_from_error(error),
         finish_reason: :error,
-        usage: nil,
+        usage: usage,
         response_summary: response_summary(context.response_summary_state, context.operation),
         response_payload: nil,
+        builtin_tool_timing: Keyword.get(opts, :builtin_tool_timing),
         error: error
       })
     )
 
     maybe_emit_reasoning_stop(context, :error)
+
+    if Keyword.get(opts, :emit_token_usage?, false) do
+      emit_token_usage(context.model, usage,
+        request_id: context.request_id,
+        operation: context.operation,
+        mode: context.mode,
+        provider: context.model.provider,
+        transport: context.transport
+      )
+    end
+
     %{context | request_stopped?: true}
   end
 
@@ -612,6 +707,15 @@ defmodule ReqLLM.Telemetry do
     }
   end
 
+  defp request_input(:ocr, opts) do
+    %{
+      document_bytes: opts[:ocr_document_bytes],
+      document_type: opts[:ocr_document_type],
+      include_images: opts[:ocr_include_images],
+      page_count: opts[:ocr_page_count]
+    }
+  end
+
   defp request_input(_operation, opts) do
     opts[:context] || opts[:messages] || opts[:text]
   end
@@ -680,6 +784,8 @@ defmodule ReqLLM.Telemetry do
       language: Map.get(input, :language)
     }
   end
+
+  defp summarize_request(:ocr, input) when is_map(input), do: input
 
   defp summarize_request(_operation, input) when is_binary(input) do
     %{text_bytes: byte_size(input)}
@@ -750,6 +856,8 @@ defmodule ReqLLM.Telemetry do
     input
     |> Map.take([:audio_bytes, :media_type, :language])
   end
+
+  defp request_payload(:ocr, input, :raw) when is_map(input), do: input
 
   defp request_payload(_operation, input, :raw), do: sanitize_generic_payload(input)
 
@@ -934,14 +1042,7 @@ defmodule ReqLLM.Telemetry do
   end
 
   defp sanitize_content_part(%ContentPart{type: :file} = part) do
-    %{
-      type: :file,
-      file_id: part.file_id,
-      filename: part.filename,
-      media_type: part.media_type,
-      bytes: binary_size_or_nil(part.data),
-      metadata: part.metadata
-    }
+    ReqLLM.ProviderFileReference.sanitize_content_part(part)
   end
 
   defp sanitize_content_part(%{type: :image} = part) when is_map(part) do
@@ -1046,6 +1147,22 @@ defmodule ReqLLM.Telemetry do
 
   defp summarize_response(:speech, audio) when is_binary(audio) do
     %{audio_bytes: byte_size(audio)}
+  end
+
+  defp summarize_response(:ocr, body) when is_map(body) do
+    pages = List.wrap(fetch_value(body, :pages))
+
+    %{
+      page_count: length(pages),
+      text_bytes:
+        Enum.reduce(pages, 0, fn page, total ->
+          total + byte_size(to_string(fetch_value(page, :markdown) || ""))
+        end),
+      image_count:
+        Enum.reduce(pages, 0, fn page, total ->
+          total + length(List.wrap(fetch_value(page, :images)))
+        end)
+    }
   end
 
   defp summarize_response(_operation, _response), do: %{}
@@ -2111,8 +2228,13 @@ defmodule ReqLLM.Telemetry do
     summary_state[:finish_reason]
   end
 
-  defp finish_reason_from_response(%Req.Response{body: body}),
-    do: finish_reason_from_response(body)
+  defp finish_reason_from_response(%Req.Response{body: body, private: private}) do
+    if get_in(private, [:req_llm, :failure_classification]) do
+      :error
+    else
+      finish_reason_from_response(body)
+    end
+  end
 
   defp finish_reason_from_response(%Response{} = response),
     do: normalize_finish_reason(response.finish_reason)

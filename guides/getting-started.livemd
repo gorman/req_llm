@@ -1,5 +1,7 @@
 # ReqLLM • Getting Started
 
+## Section
+
 [![Run in Livebook](https://livebook.dev/badge/v1/blue.svg)](https://livebook.dev/run?url=https%3A%2F%2Fgithub.com%2Fagentjido%2Freq_llm%2Fblob%2Fmain%2Fguides%2Fgetting-started.livemd)
 
 ```elixir
@@ -15,7 +17,7 @@ Mix.install([
 
 Enter your API keys for the providers you want to use. At least one provider key is required.
 
-**Tip:** You can also add keys to Livebook secrets as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GROQ_API_KEY` to avoid re-entering them each time.
+**Tip:** You can also add keys to Livebook secrets as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GROQ_API_KEY` to avoid re-entering them each time. Livebook exposes these secrets to the notebook with an `LB_` prefix.
 
 ```elixir
 openai_key_input = Kino.Input.password("OpenAI API Key")
@@ -27,86 +29,66 @@ Kino.Layout.grid([openai_key_input, anthropic_key_input, groq_key_input], column
 
 ```elixir
 available_models = [
-  {"openai:gpt-4o", "OpenAI GPT-4o"},
-  {"openai:gpt-4o-mini", "OpenAI GPT-4o Mini"},
-  {"anthropic:claude-sonnet-4-5-20250929", "Anthropic Claude Sonnet 4.5"},
-  {"anthropic:claude-3-5-haiku-20241022", "Anthropic Claude 3.5 Haiku"},
-  {"groq:llama-3.3-70b-versatile", "Groq Llama 3.3 70B"},
-  {"groq:llama-3.1-8b-instant", "Groq Llama 3.1 8B"}
+  {"openai:gpt-5", "OpenAI GPT-5"},
+  {"openai:gpt-5-mini", "OpenAI GPT-5 Mini"},
+  {"anthropic:claude-sonnet-4-6", "Anthropic Claude Sonnet 4.6"},
+  {"anthropic:claude-haiku-4-5", "Anthropic Claude Haiku 4.5"},
+  {"groq:openai/gpt-oss-120b", "Groq GPT-OSS 120B"},
+  {"groq:openai/gpt-oss-20b", "Groq GPT-OSS 20B"}
 ]
 
 model_input = Kino.Input.select("Select Model", available_models)
 ```
 
 ```elixir
-# Try to get keys from Livebook secrets first, then fall back to inputs
-openai_key = 
-  case ReqLLM.get_key(:openai_api_key) do
-    {:ok, key} when is_binary(key) and key != "" -> key
-    _ -> 
-      input_key = Kino.Input.read(openai_key_input)
-      if input_key != "" and input_key != nil do
-        ReqLLM.put_key(:openai_api_key, input_key)
-        input_key
-      else
-        nil
-      end
-  end
+provider_configurations = [
+  {"openai", :openai, "OPENAI_API_KEY", openai_key_input},
+  {"anthropic", :anthropic, "ANTHROPIC_API_KEY", anthropic_key_input},
+  {"groq", :groq, "GROQ_API_KEY", groq_key_input}
+]
 
-anthropic_key = 
-  case ReqLLM.get_key(:anthropic_api_key) do
-    {:ok, key} when is_binary(key) and key != "" -> key
-    _ -> 
-      input_key = Kino.Input.read(anthropic_key_input)
-      if input_key != "" and input_key != nil do
-        ReqLLM.put_key(:anthropic_api_key, input_key)
-        input_key
-      else
-        nil
-      end
-  end
+key_statuses =
+  Map.new(provider_configurations, fn {provider_name, provider, env_var, input} ->
+    livebook_key = System.get_env("LB_" <> env_var)
 
-groq_key = 
-  case ReqLLM.get_key(:groq_api_key) do
-    {:ok, key} when is_binary(key) and key != "" -> key
-    _ -> 
-      input_key = Kino.Input.read(groq_key_input)
-      if input_key != "" and input_key != nil do
-        ReqLLM.put_key(:groq_api_key, input_key)
-        input_key
-      else
-        nil
+    key_status =
+      cond do
+        is_binary(livebook_key) and livebook_key != "" ->
+          ReqLLM.put_key(ReqLLM.Keys.config_key(provider), livebook_key)
+          {:ok, :livebook}
+
+        true ->
+          case ReqLLM.Keys.get(provider) do
+            {:ok, _key, source} ->
+              {:ok, source}
+
+            {:error, _reason} ->
+              input_key = Kino.Input.read(input)
+
+              if is_binary(input_key) and input_key != "" do
+                ReqLLM.put_key(ReqLLM.Keys.config_key(provider), input_key)
+                {:ok, :manual}
+              else
+                :missing
+              end
+          end
       end
-  end
+
+    {provider_name, key_status}
+  end)
 
 selected_model = Kino.Input.read(model_input)
 provider = selected_model |> String.split(":") |> List.first()
 
-has_key? =
-  case provider do
-    "openai" -> openai_key != nil
-    "anthropic" -> anthropic_key != nil
-    "groq" -> groq_key != nil
-    _ -> false
-  end
+key_status = Map.get(key_statuses, provider, :missing)
+has_key? = match?({:ok, _source}, key_status)
 
 key_source =
-  case provider do
-    "openai" -> 
-      case ReqLLM.get_key(:openai_api_key) do
-        {:ok, _} -> "✨ Livebook secrets"
-        _ -> "manual input"
-      end
-    "anthropic" -> 
-      case ReqLLM.get_key(:anthropic_api_key) do
-        {:ok, _} -> "✨ Livebook secrets"
-        _ -> "manual input"
-      end
-    "groq" -> 
-      case ReqLLM.get_key(:groq_api_key) do
-        {:ok, _} -> "✨ Livebook secrets"
-        _ -> "manual input"
-      end
+  case key_status do
+    {:ok, :livebook} -> "Livebook secret"
+    {:ok, :system} -> "environment variable"
+    {:ok, :application} -> "application configuration"
+    {:ok, :manual} -> "manual input"
     _ -> "unknown"
   end
 
@@ -246,14 +228,13 @@ tools = [weather_tool, time_tool]
 
 {:ok, response} = ReqLLM.generate_text(selected_model, tools_prompt, tools: tools)
 
-last_message = List.last(response.context.messages)
-tool_calls = Enum.filter(last_message.content, fn part -> part.type == :tool_call end)
+tool_calls = ReqLLM.Response.tool_calls(response)
 
 output = if tool_calls != [] do
-  results = Enum.map(tool_calls, fn tc ->
-    tool = Enum.find(tools, fn t -> t.name == tc.tool_name end)
-    {:ok, result} = ReqLLM.Tool.execute(tool, tc.input)
-    "**#{tc.tool_name}** (#{inspect(tc.input)})\n→ #{result}"
+  results = Enum.map(tool_calls, fn tool_call ->
+    %{name: name, arguments: arguments} = ReqLLM.ToolCall.to_map(tool_call)
+    {:ok, result} = ReqLLM.ToolCall.execute(tool_call, tools)
+    "**#{name}** (#{inspect(arguments)})\n→ #{result}"
   end)
   Enum.join(results, "\n\n")
 else
@@ -300,4 +281,4 @@ Embeddings can be used for:
 """)
 ```
 
-<!-- livebook:{"offset":9130,"stamp":{"token":"XCP.VlbEPeXcpGOVOkKwlL51N3JmxW178MKDAHVsEAVE6EVPiH--5Vm-p5yRlMjIMonLkmK1-SvD4bfer64DuZCDyN01TipjRkNuHj--g93kIZdzoX75eOVzvnh_m-WkKGCjrkwUL7ds582uVnSFbuRwFgmcdfLupoWdVkbr919wi30","version":2}} -->
+<!-- livebook:{"offset":7816,"stamp":{"token":"XCP.n0_OLGGywE7KdRjliywrGs2LXv9SgvznJ0R11yS0hbsxD7Z28CJfO1uYSDNHu5GL2GCJi090J5pdc_WhRNQ_2yqP9uOe8irO7NwxTZpWYOWvNgJb1Za8Z0CM8HYUSEHM-PbzJJqK2tu0uh4EomFX","version":2}} -->

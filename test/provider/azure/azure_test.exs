@@ -91,7 +91,7 @@ defmodule ReqLLM.Providers.AzureTest do
           req_http_options: [finch: :custom_finch]
         )
 
-      assert request.options[:finch] == :custom_finch
+      assert request.options[:finch] == [name: :custom_finch]
     end
 
     test "embedding operation uses correct endpoint" do
@@ -126,6 +126,26 @@ defmodule ReqLLM.Providers.AzureTest do
                  deployment: "my-deployment",
                  base_url: "https://my-resource.openai.azure.com/openai"
                )
+    end
+
+    test "embedding operation returns an error tuple for invalid options" do
+      model = %LLMDB.Model{
+        id: "text-embedding-3-small",
+        provider: :azure,
+        capabilities: %{embeddings: true}
+      }
+
+      assert {:error, error} =
+               Azure.prepare_request(
+                 :embedding,
+                 model,
+                 "Hello",
+                 deployment: "my-embedding-deployment",
+                 base_url: "https://my-resource.openai.azure.com/openai",
+                 provider_options: [dimensions: "not-an-integer"]
+               )
+
+      assert Exception.message(error) =~ "dimensions"
     end
   end
 
@@ -529,7 +549,7 @@ defmodule ReqLLM.Providers.AzureTest do
     end
 
     test "delegates to OpenAI for o1 reasoning models - translates max_tokens" do
-      {:ok, model} = ReqLLM.model("azure:o1-mini")
+      {:ok, model} = ReqLLM.model("azure:o1")
 
       opts = [max_tokens: 1000, temperature: 0.7]
       {translated_opts, warnings} = Azure.translate_options(:chat, model, opts)
@@ -565,7 +585,7 @@ defmodule ReqLLM.Providers.AzureTest do
     end
 
     test "passes through options unchanged for non-chat operations" do
-      {:ok, model} = ReqLLM.model("azure:o1-mini")
+      {:ok, model} = ReqLLM.model("azure:o1")
 
       opts = [max_tokens: 1000, temperature: 0.7]
       {translated_opts, warnings} = Azure.translate_options(:embedding, model, opts)
@@ -704,7 +724,7 @@ defmodule ReqLLM.Providers.AzureTest do
     end
 
     test "extracts reasoning tokens for o1 models" do
-      {:ok, model} = ReqLLM.model("azure:o1-mini")
+      {:ok, model} = ReqLLM.model("azure:o1")
 
       body = %{
         "usage" => %{

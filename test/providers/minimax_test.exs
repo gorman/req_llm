@@ -5,6 +5,7 @@ defmodule ReqLLM.Providers.MinimaxTest do
   alias ReqLLM.Message.ReasoningDetails
   alias ReqLLM.Provider.ResponseBuilder
   alias ReqLLM.Providers.Minimax
+  alias ReqLLM.Providers.Minimax.ImagesAPI
   alias ReqLLM.StreamChunk
   alias ReqLLM.ToolCall
 
@@ -22,6 +23,20 @@ defmodule ReqLLM.Providers.MinimaxTest do
     }
   end
 
+  defp minimax_image_model(model_id \\ "image-01") do
+    %LLMDB.Model{
+      id: model_id,
+      model: model_id,
+      provider_model_id: model_id,
+      provider: :minimax,
+      name: model_id,
+      family: "minimax-image",
+      capabilities: %{images: true},
+      limits: %{},
+      extra: %{}
+    }
+  end
+
   describe "provider contract" do
     test "provider identity and configuration" do
       assert Minimax.provider_id() == :minimax
@@ -34,6 +49,8 @@ defmodule ReqLLM.Providers.MinimaxTest do
 
       assert :max_completion_tokens in schema_keys
       assert :reasoning_split in schema_keys
+      assert :prompt_optimizer in schema_keys
+      assert :subject_reference in schema_keys
     end
 
     test "provider_extended_generation_schema includes all core keys" do
@@ -344,6 +361,354 @@ defmodule ReqLLM.Providers.MinimaxTest do
 
       assert List.last(response.context.messages).reasoning_details ==
                response.message.reasoning_details
+    end
+
+    test "stream decoding matches non-streaming reasoning details" do
+      reasoning_detail = %{
+        "type" => "reasoning.text",
+        "id" => "reasoning-text-1",
+        "format" => "MiniMax-response-v1",
+        "index" => 0,
+        "text" => "Think"
+      }
+
+      event = %{
+        data: %{
+          "choices" => [
+            %{
+              "index" => 0,
+              "delta" => %{
+                "reasoning_content" => "Think",
+                "reasoning_details" => [reasoning_detail]
+              }
+            }
+          ]
+        }
+      }
+
+      assert [%StreamChunk{type: :thinking}, %StreamChunk{type: :meta} = metadata_chunk] =
+               Minimax.decode_stream_event(event, minimax_model())
+
+      body =
+        openai_format_json_fixture(model: "MiniMax-M2.7", content: "Done")
+        |> put_in(
+          ["choices", Access.at(0), "message", "reasoning_details"],
+          [reasoning_detail]
+        )
+
+      request = %Req.Request{
+        options: [
+          context: context_fixture(),
+          model: "MiniMax-M2.7",
+          operation: :chat
+        ]
+      }
+
+      {_request, response} =
+        Minimax.decode_response({request, %Req.Response{status: 200, body: body}})
+
+      assert metadata_chunk.metadata.reasoning_details ==
+               response.body.message.reasoning_details
+
+      assert [
+               %ReasoningDetails{
+                 text: "Think",
+                 signature: "reasoning-text-1",
+                 provider: :minimax,
+                 format: "MiniMax-response-v1",
+                 index: 0,
+                 provider_data: %{"type" => "reasoning.text"}
+               }
+             ] = metadata_chunk.metadata.reasoning_details
+    end
+  end
+
+  describe "image generation" do
+    test "prepare_request for :image creates /image_generation request with api_mod" do
+      model = minimax_image_model()
+
+      {:ok, request} = Minimax.prepare_request(:image, model, "A red square", api_key: "test-key")
+
+      assert %Req.Request{} = request
+      assert request.url.path == "/image_generation"
+      assert request.method == :post
+      assert request.options[:base_url] == "https://api.minimax.io/v1"
+      assert request.options[:api_mod] == ImagesAPI
+      assert request.options[:prompt] == "A red square"
+      assert request.options[:operation] == :image
+    end
+
+    test "prepare_request for :image rejects empty prompt" do
+      model = minimax_image_model()
+      context = Context.new([Context.system("you are helpful")])
+
+      assert {:error, %ReqLLM.Error.Invalid.Parameter{}} =
+               Minimax.prepare_request(:image, model, context, api_key: "test-key")
+    end
+
+    test "encode_body emits MiniMax-native JSON with base64 response format" do
+      request =
+        Req.new(url: ImagesAPI.path())
+        |> Req.Request.register_options([
+          :model,
+          :prompt,
+          :n,
+          :aspect_ratio,
+          :response_format,
+          :seed,
+          :provider_options,
+          :context
+        ])
+        |> Req.Request.merge_options(
+          model: "image-01",
+          prompt: "A lighthouse",
+          n: 2,
+          aspect_ratio: "16:9",
+          response_format: :binary,
+          seed: 42,
+          provider_options: [prompt_optimizer: true],
+          context: %Context{messages: []}
+        )
+
+      encoded = ImagesAPI.encode_body(request)
+      body = ReqLLM.Test.Helpers.json_body(encoded)
+
+      assert body["model"] == "image-01"
+      assert body["prompt"] == "A lighthouse"
+      assert body["n"] == 2
+      assert body["aspect_ratio"] == "16:9"
+      assert body["response_format"] == "base64"
+      assert body["seed"] == 42
+      assert body["prompt_optimizer"] == true
+      refute Map.has_key?(body, "subject_reference")
+    end
+
+    test "encode_body maps size to aspect_ratio when aspect_ratio is absent" do
+      request =
+        Req.new(url: ImagesAPI.path())
+        |> Req.Request.register_options([:model, :prompt, :size, :response_format, :context])
+        |> Req.Request.merge_options(
+          model: "image-01",
+          prompt: "A lighthouse",
+          size: "1024x1024",
+          response_format: :url,
+          context: %Context{messages: []}
+        )
+
+      encoded = ImagesAPI.encode_body(request)
+      body = ReqLLM.Test.Helpers.json_body(encoded)
+
+      assert body["aspect_ratio"] == "1:1"
+      assert body["response_format"] == "url"
+      refute Map.has_key?(body, "width")
+      refute Map.has_key?(body, "height")
+    end
+
+    test "encode_body preserves string and tuple non-canonical sizes" do
+      for size <- ["1792x1024", {1792, 1024}] do
+        request =
+          Req.new(url: ImagesAPI.path())
+          |> Req.Request.register_options([:model, :prompt, :size, :response_format, :context])
+          |> Req.Request.merge_options(
+            model: "image-01",
+            prompt: "A lighthouse",
+            size: size,
+            response_format: :url,
+            context: %Context{messages: []}
+          )
+
+        encoded = ImagesAPI.encode_body(request)
+        body = ReqLLM.Test.Helpers.json_body(encoded)
+
+        assert body["width"] == 1792
+        assert body["height"] == 1024
+        refute Map.has_key?(body, "aspect_ratio")
+      end
+    end
+
+    test "encode_body forwards subject_reference for image-to-image" do
+      request =
+        Req.new(url: ImagesAPI.path())
+        |> Req.Request.register_options([
+          :model,
+          :prompt,
+          :response_format,
+          :provider_options,
+          :context
+        ])
+        |> Req.Request.merge_options(
+          model: "image-01",
+          prompt: "A girl by a window",
+          response_format: :binary,
+          provider_options: [
+            subject_reference: [type: "character", image_file: "https://example.com/face.jpg"]
+          ],
+          context: %Context{messages: []}
+        )
+
+      encoded = ImagesAPI.encode_body(request)
+      body = ReqLLM.Test.Helpers.json_body(encoded)
+
+      assert body["subject_reference"] == [
+               %{"type" => "character", "image_file" => "https://example.com/face.jpg"}
+             ]
+    end
+
+    test "prepare_request and encode_body accept a string-keyed subject_reference map" do
+      model = minimax_image_model()
+
+      {:ok, request} =
+        Minimax.prepare_request(:image, model, "A girl by a window",
+          api_key: "test-key",
+          provider_options: [
+            subject_reference: %{
+              "type" => "character",
+              "image_file" => "https://example.com/face.jpg"
+            }
+          ]
+        )
+
+      encoded = Minimax.encode_body(request)
+      body = ReqLLM.Test.Helpers.json_body(encoded)
+
+      assert body["subject_reference"] == [
+               %{"type" => "character", "image_file" => "https://example.com/face.jpg"}
+             ]
+    end
+
+    test "generate_image completes a MiniMax public API round trip" do
+      image_data = <<0xFF, 0xD8, 0xFF, 0xE0, "generated-image">>
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        assert conn.method == "POST"
+        assert conn.request_path == "/v1/image_generation"
+        assert Plug.Conn.get_req_header(conn, "authorization") == ["Bearer test-key"]
+
+        {:ok, request_body, conn} = Plug.Conn.read_body(conn)
+        request_json = Jason.decode!(request_body)
+
+        assert request_json["model"] == "image-01"
+        assert request_json["prompt"] == "A girl by a window"
+        assert request_json["width"] == 1792
+        assert request_json["height"] == 1024
+
+        assert request_json["subject_reference"] == [
+                 %{
+                   "type" => "character",
+                   "image_file" => "https://example.com/face.jpg"
+                 }
+               ]
+
+        Req.Test.json(conn, %{
+          "id" => "trace-public-api",
+          "data" => %{"image_base64" => [Base.encode64(image_data)]},
+          "base_resp" => %{"status_code" => 0, "status_msg" => "success"}
+        })
+      end)
+
+      assert {:ok, response} =
+               ReqLLM.generate_image(minimax_image_model(), "A girl by a window",
+                 api_key: "test-key",
+                 size: "1792x1024",
+                 provider_options: [
+                   subject_reference: %{
+                     "type" => "character",
+                     "image_file" => "https://example.com/face.jpg"
+                   }
+                 ],
+                 req_http_options: [plug: {Req.Test, __MODULE__}]
+               )
+
+      assert response.id == "trace-public-api"
+      assert ReqLLM.Response.image_data(response) == image_data
+      assert [%{type: :image, media_type: "image/jpeg"}] = ReqLLM.Response.images(response)
+    end
+
+    test "decode_response detects image media type from decoded bytes" do
+      req =
+        Req.new(url: ImagesAPI.path())
+        |> Req.Request.register_options([:model, :output_format, :context])
+        |> Req.Request.merge_options(
+          model: "image-01",
+          output_format: :png,
+          context: %Context{messages: []}
+        )
+
+      images = [
+        {<<0xFF, 0xD8, 0xFF, 0xE0, "jpeg">>, "image/jpeg"},
+        {<<0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, "png">>, "image/png"},
+        {<<"RIFF", 4::little-32, "WEBP", "webp">>, "image/webp"}
+      ]
+
+      for {image_data, expected_media_type} <- images do
+        resp = %Req.Response{
+          status: 200,
+          body: %{
+            "id" => "trace-123",
+            "data" => %{"image_base64" => [Base.encode64(image_data)]},
+            "base_resp" => %{"status_code" => 0, "status_msg" => "success"}
+          }
+        }
+
+        {_req, updated} = ImagesAPI.decode_response({req, resp})
+
+        assert %ReqLLM.Response{} = updated.body
+        assert updated.body.id == "trace-123"
+        assert ReqLLM.Response.image_data(updated.body) == image_data
+
+        [part] = ReqLLM.Response.images(updated.body)
+        assert part.type == :image
+        assert part.media_type == expected_media_type
+      end
+    end
+
+    test "decode_response decodes image_urls array into image_url content parts" do
+      req =
+        Req.new(url: ImagesAPI.path())
+        |> Req.Request.register_options([:model, :context])
+        |> Req.Request.merge_options(
+          model: "image-01",
+          context: %Context{messages: []}
+        )
+
+      resp = %Req.Response{
+        status: 200,
+        body: %{
+          "data" => %{"image_urls" => ["https://example.com/img1.png"]}
+        }
+      }
+
+      {_req, updated} = ImagesAPI.decode_response({req, resp})
+
+      assert %ReqLLM.Response{} = updated.body
+      assert ReqLLM.Response.image_url(updated.body) == "https://example.com/img1.png"
+
+      [part] = ReqLLM.Response.images(updated.body)
+      assert part.type == :image_url
+    end
+
+    test "decode_response returns an error on base_resp status_code != 0 even with HTTP 200" do
+      req =
+        Req.new(url: ImagesAPI.path())
+        |> Req.Request.register_options([:model, :context])
+        |> Req.Request.merge_options(
+          model: "image-01",
+          context: %Context{messages: []}
+        )
+
+      resp = %Req.Response{
+        status: 200,
+        body: %{
+          "data" => %{},
+          "base_resp" => %{"status_code" => 1026, "status_msg" => "Sensitive content"}
+        }
+      }
+
+      {_req, result} = ImagesAPI.decode_response({req, resp})
+
+      assert %ReqLLM.Error.API.Response{} = result
+      assert result.status == 1026
+      assert result.reason =~ "1026"
     end
   end
 end

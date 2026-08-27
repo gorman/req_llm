@@ -159,6 +159,8 @@ defmodule ReqLLM.Usage.Normalize do
         get_in(usage, [:completion_tokens_details, :reasoning_tokens]) ||
         get_in(usage, ["output_tokens_details", "reasoning_tokens"]) ||
         get_in(usage, [:output_tokens_details, :reasoning_tokens]) ||
+        get_in(usage, ["output_tokens_details", "thinking_tokens"]) ||
+        get_in(usage, [:output_tokens_details, :thinking_tokens]) ||
         MapAccess.get(usage, "reasoning_tokens") ||
         MapAccess.get(usage, :reasoning_tokens) ||
         MapAccess.get(usage, "reasoning_output_tokens") ||
@@ -196,14 +198,21 @@ defmodule ReqLLM.Usage.Normalize do
 
   defp get_cache_creation_tokens(usage, input, input_includes_cached) do
     creation =
-      MapAccess.get(usage, :cache_creation_input_tokens) ||
+      MapAccess.get(usage, :cache_creation_tokens) ||
+        MapAccess.get(usage, :cache_creation) ||
+        MapAccess.get(usage, :cache_write_tokens) ||
+        MapAccess.get(usage, :cache_creation_input_tokens) ||
         MapAccess.get(usage, "cache_creation_input_tokens") ||
         MapAccess.get(usage, :cacheWriteInputTokens) ||
         MapAccess.get(usage, "cacheWriteInputTokens") ||
         MapAccess.get(usage, :cacheWriteInputTokenCount) ||
         MapAccess.get(usage, "cacheWriteInputTokenCount") ||
         MapAccess.get(usage, :cache_write_input_tokens) ||
-        MapAccess.get(usage, "cache_write_input_tokens")
+        MapAccess.get(usage, "cache_write_input_tokens") ||
+        get_in(usage, ["prompt_tokens_details", "cache_write_tokens"]) ||
+        get_in(usage, [:prompt_tokens_details, :cache_write_tokens]) ||
+        get_in(usage, ["input_tokens_details", "cache_write_tokens"]) ||
+        get_in(usage, [:input_tokens_details, :cache_write_tokens])
 
     if input_includes_cached do
       clamp_tokens(creation, input)

@@ -55,6 +55,7 @@ defmodule Mix.Tasks.ReqLlm.ModelCompat do
   ## Flags
 
       --available        List all models from models.dev API registry (no implementation filter)
+      --support-tiers    Annotate --available output with evidence-derived support tiers
       --sample           Further reduce to sample subset (see :sample_* config or fallback)
       --type TYPE        Operation type: text, embedding, image, speech, transcription, rerank, ocr, or all
       --record           Re-record fixtures (live API calls)
@@ -74,46 +75,9 @@ defmodule Mix.Tasks.ReqLlm.ModelCompat do
 
   use Mix.Task
 
-  @preferred_cli_env :test
-  @capability_scenarios %{
-    "core" => ~w(basic usage token_limit),
-    "conversation" => ~w(context_append),
-    "streaming" => ~w(streaming),
-    "tools" => ~w(tool_none tool_multi tool_round_trip),
-    "objects" => ~w(object_basic object_streaming),
-    "reasoning" => ~w(reasoning),
-    "embedding" => ~w(embed_basic embed_usage embed_batch),
-    "image" => ~w(image_basic),
-    "speech" => ~w(speech_basic),
-    "transcription" => ~w(transcription_basic),
-    "rerank" => ~w(rerank_basic),
-    "ocr" => ~w(ocr_basic),
-    "grounding" => ~w(grounding_basic grounding_with_context grounding_streaming),
-    "grounding_legacy" => ~w(grounding_legacy),
-    "multimodal_tool_result" => ~w(multimodal_tool_result),
-    "web_search" => ~w(web_search_basic web_search_streaming x_search_streaming),
-    "streaming_structured_output" =>
-      ~w(object_streaming_json_schema object_streaming_tool_strict object_streaming_auto streaming_error_handling)
-  }
+  alias ReqLLM.Compatibility.{Evidence, ScenarioCatalog}
 
-  @scenario_test_files %{
-    google: %{
-      "grounding_basic" => "test/coverage/google/grounding_test.exs",
-      "grounding_with_context" => "test/coverage/google/grounding_test.exs",
-      "grounding_streaming" => "test/coverage/google/grounding_test.exs",
-      "grounding_legacy" => "test/coverage/google/grounding_test.exs",
-      "multimodal_tool_result" => "test/coverage/google/multimodal_tool_result_test.exs"
-    },
-    xai: %{
-      "web_search_basic" => "test/coverage/xai/web_search_test.exs",
-      "web_search_streaming" => "test/coverage/xai/web_search_test.exs",
-      "x_search_streaming" => "test/coverage/xai/web_search_test.exs",
-      "object_streaming_json_schema" => "test/coverage/xai/streaming_structured_output_test.exs",
-      "object_streaming_tool_strict" => "test/coverage/xai/streaming_structured_output_test.exs",
-      "object_streaming_auto" => "test/coverage/xai/streaming_structured_output_test.exs",
-      "streaming_error_handling" => "test/coverage/xai/streaming_structured_output_test.exs"
-    }
-  }
+  @preferred_cli_env :test
 
   @impl Mix.Task
   def run(args) do
@@ -125,6 +89,7 @@ defmodule Mix.Tasks.ReqLlm.ModelCompat do
         switches: [
           sample: :boolean,
           available: :boolean,
+          support_tiers: :boolean,
           type: :string,
           record: :boolean,
           record_all: :boolean,
@@ -153,15 +118,22 @@ defmodule Mix.Tasks.ReqLlm.ModelCompat do
       |> csv_values()
       |> Enum.flat_map(&capability_scenarios!/1)
 
-    operation_capability = Atom.to_string(operation)
+    operation_defaults = ScenarioCatalog.operation_defaults(operation, opts[:capability])
 
-    operation_defaults =
-      if opts[:capability] == operation_capability and
-           Map.has_key?(@capability_scenarios, operation_capability) do
-        Map.fetch!(@capability_scenarios, operation_capability)
-      else
-        []
-      end
+    (scenarios ++ capability_scenarios ++ operation_defaults)
+    |> Enum.uniq()
+  end
+
+  @doc false
+  def scenarios_for_opts(opts, operation, provider) when is_atom(provider) do
+    scenarios = csv_values(opts[:scenario])
+
+    capability_scenarios =
+      opts[:capability]
+      |> csv_values()
+      |> Enum.flat_map(&capability_scenarios!(&1, provider))
+
+    operation_defaults = ScenarioCatalog.operation_defaults(operation, opts[:capability])
 
     (scenarios ++ capability_scenarios ++ operation_defaults)
     |> Enum.uniq()
@@ -169,7 +141,16 @@ defmodule Mix.Tasks.ReqLlm.ModelCompat do
 
   @doc false
   def capability_scenarios!(capability) when is_binary(capability) do
-    case Map.fetch(@capability_scenarios, capability) do
+    case ScenarioCatalog.scenarios_for_capability(capability) do
+      {:ok, scenarios} -> scenarios
+      :error -> Mix.raise("Unknown capability group: #{capability}")
+    end
+  end
+
+  @doc false
+  def capability_scenarios!(capability, provider)
+      when is_binary(capability) and is_atom(provider) do
+    case ScenarioCatalog.model_compat_scenarios_for_capability(capability, provider) do
       {:ok, scenarios} -> scenarios
       :error -> Mix.raise("Unknown capability group: #{capability}")
     end
@@ -184,6 +165,7 @@ defmodule Mix.Tasks.ReqLlm.ModelCompat do
     operation = parse_operation_type(opts[:type])
     sample_specs = if opts[:sample], do: default_specs_for_operation(operation)
     implemented_providers = get_implemented_providers()
+    evidence = if opts[:support_tiers], do: Evidence.load!()
 
     Mix.shell().info("\n#{header(opts[:sample])}\n")
 
@@ -221,7 +203,7 @@ defmodule Mix.Tasks.ReqLlm.ModelCompat do
         )
 
         Enum.each(filtered, fn model ->
-          print_model_with_status(model, provider, state)
+          print_model_with_status(model, provider, state, evidence, operation)
         end)
 
         Mix.shell().info("")
@@ -361,10 +343,12 @@ defmodule Mix.Tasks.ReqLlm.ModelCompat do
     Mix.shell().info("----------------------------------------------------\n")
 
     models = load_registry()
-    specs = select_models(models, model_spec, opts)
+
+    selected_specs = select_models(models, model_spec, opts)
+    specs = filter_capability_specs(selected_specs, opts)
 
     if Enum.empty?(specs) do
-      Mix.raise("No models match spec: #{inspect(model_spec)}")
+      raise_for_empty_specs(selected_specs, model_spec, opts)
     end
 
     total_specs = length(specs)
@@ -405,10 +389,12 @@ defmodule Mix.Tasks.ReqLlm.ModelCompat do
     Mix.shell().info("----------------------------------------------------\n")
 
     models = load_registry()
-    specs = select_models(models, nil, opts)
+
+    selected_specs = select_models(models, nil, opts)
+    specs = filter_capability_specs(selected_specs, opts)
 
     if Enum.empty?(specs) do
-      Mix.raise("No models match spec")
+      raise_for_empty_specs(selected_specs, nil, opts)
     end
 
     total_specs = length(specs)
@@ -444,7 +430,7 @@ defmodule Mix.Tasks.ReqLlm.ModelCompat do
   end
 
   defp test_model(provider, model_id, opts) do
-    scenarios = scenarios_for_opts(opts, parse_operation_type(opts[:type]))
+    scenarios = scenarios_for_opts(opts, parse_operation_type(opts[:type]), provider)
 
     if Enum.empty?(scenarios) do
       run_test_invocation(provider, model_id, opts, nil)
@@ -489,6 +475,7 @@ defmodule Mix.Tasks.ReqLlm.ModelCompat do
          {"REQ_LLM_FIXTURES_MODE", mode},
          {"REQ_LLM_DEBUG", "1"},
          {"REQ_LLM_INCLUDE_RESPONSES", "1"},
+         {"REQ_LLM_INCLUDE_COVERAGE", "1"},
          {"REQ_LLM_FIXTURE_ALLOW_CREDENTIAL_FALLBACK", "0"}
        ] ++ cloud_env_vars)
       |> maybe_put_record_root(stage_dir)
@@ -529,9 +516,7 @@ defmodule Mix.Tasks.ReqLlm.ModelCompat do
   @doc false
   def test_args_for(provider, operation, scenario \\ nil) do
     provider = normalize_provider(provider)
-
-    args =
-      scenario_test_args(provider, scenario) || base_test_args(provider, operation)
+    args = ["test", ScenarioCatalog.test_file(provider, operation, scenario)]
 
     if scenario do
       args ++ ["--only", "scenario:#{scenario}"]
@@ -544,58 +529,24 @@ defmodule Mix.Tasks.ReqLlm.ModelCompat do
     test_args_for(provider, operation, scenario)
   end
 
-  defp scenario_test_args(_provider, nil), do: nil
-
-  defp scenario_test_args(provider, scenario) do
-    provider
-    |> then(&Map.get(@scenario_test_files, &1, %{}))
-    |> Map.get(to_string(scenario))
-    |> case do
-      nil -> nil
-      path -> ["test", path]
-    end
-  end
-
   defp normalize_provider(provider) when is_atom(provider), do: provider
   defp normalize_provider(provider) when is_binary(provider), do: String.to_atom(provider)
 
-  defp base_test_args(provider, :all) do
-    ["test", "test/coverage/#{provider}"]
-  end
-
-  defp base_test_args(provider, :embedding) do
-    ["test", "test/coverage/#{provider}/embedding_test.exs"]
-  end
-
-  defp base_test_args(provider, :image) do
-    ["test", "test/coverage/#{provider}/image_generation_test.exs"]
-  end
-
-  defp base_test_args(provider, :speech) do
-    ["test", "test/coverage/#{provider}/speech_test.exs"]
-  end
-
-  defp base_test_args(provider, :transcription) do
-    ["test", "test/coverage/#{provider}/transcription_test.exs"]
-  end
-
-  defp base_test_args(provider, :rerank) do
-    ["test", "test/coverage/#{provider}/rerank_test.exs"]
-  end
-
-  defp base_test_args(provider, :ocr) do
-    ["test", "test/coverage/#{provider}/ocr_test.exs"]
-  end
-
-  defp base_test_args(provider, :text) do
-    ["test", "test/coverage/#{provider}/comprehensive_test.exs"]
-  end
-
-  defp parse_test_result(provider, model_id, output, exit_code, scenario) do
+  @doc false
+  def parse_test_result(provider, model_id, output, exit_code, scenario) do
     {passed, failed, total} = parse_exunit_summary(output)
 
-    status = if exit_code == 0 && failed == 0, do: :pass, else: :fail
-    fixtures = extract_fixtures(output)
+    status = if exit_code == 0 && failed == 0 && passed > 0, do: :pass, else: :fail
+    fixtures = output |> extract_fixtures() |> fallback_scenario_fixtures(scenario)
+
+    error =
+      cond do
+        total == 0 -> "No matching compatibility tests executed"
+        failed > 0 or exit_code != 0 -> extract_error(output)
+        true -> nil
+      end
+
+    failure_layer = if status == :pass, do: nil, else: Evidence.classify_failure(error || output)
 
     %{
       provider: provider,
@@ -605,7 +556,8 @@ defmodule Mix.Tasks.ReqLlm.ModelCompat do
       passed: passed,
       failed: failed,
       total: total,
-      error: if(failed > 0, do: extract_error(output)),
+      error: error,
+      failure_layer: failure_layer,
       fixtures: fixtures,
       scenario: scenario
     }
@@ -651,6 +603,7 @@ defmodule Mix.Tasks.ReqLlm.ModelCompat do
           "scenario" => result.scenario,
           "status" => Atom.to_string(result.status),
           "fixtures" => result.fixtures,
+          "failure_layer" => result.failure_layer,
           "error" => result.error
         }
       end)
@@ -669,6 +622,7 @@ defmodule Mix.Tasks.ReqLlm.ModelCompat do
       failed: Enum.reduce(results, 0, &(&1.failed + &2)),
       total: Enum.reduce(results, 0, &(&1.total + &2)),
       error: if(errors == [], do: nil, else: Enum.join(errors, "\n")),
+      failure_layer: nil,
       fixtures:
         results
         |> Enum.flat_map(& &1.fixtures)
@@ -685,6 +639,35 @@ defmodule Mix.Tasks.ReqLlm.ModelCompat do
     |> Enum.map(&String.trim/1)
     |> Enum.reject(&(&1 == ""))
   end
+
+  defp filter_capability_specs(specs, opts) do
+    if csv_values(opts[:capability]) == [] do
+      specs
+    else
+      operation = parse_operation_type(opts[:type])
+
+      Enum.filter(specs, fn {provider, _model_id} ->
+        scenarios_for_opts(opts, operation, provider) != []
+      end)
+    end
+  end
+
+  @spec raise_for_empty_specs(list(), binary() | nil, keyword()) :: no_return()
+  defp raise_for_empty_specs(selected_specs, model_spec, opts) do
+    capabilities = csv_values(opts[:capability])
+
+    if selected_specs != [] and capabilities != [] do
+      Mix.raise(
+        "No replayable per-model scenarios apply to capability #{Enum.join(capabilities, ",")}" <>
+          model_spec_suffix(model_spec)
+      )
+    else
+      Mix.raise("No models match spec#{model_spec_suffix(model_spec)}")
+    end
+  end
+
+  defp model_spec_suffix(nil), do: ""
+  defp model_spec_suffix(model_spec), do: ": #{inspect(model_spec)}"
 
   defp max_concurrency(opts) do
     cond do
@@ -795,6 +778,15 @@ defmodule Mix.Tasks.ReqLlm.ModelCompat do
     |> Enum.reject(&is_nil/1)
     |> Enum.uniq()
   end
+
+  defp fallback_scenario_fixtures([], scenario) when is_binary(scenario) do
+    case ScenarioCatalog.fetch_scenario(scenario) do
+      {:ok, metadata} -> metadata.fixtures
+      :error -> []
+    end
+  end
+
+  defp fallback_scenario_fixtures(fixtures, _scenario), do: fixtures
 
   defp print_enhanced_summary(model_spec, results, registry, elapsed_ms, opts) do
     Mix.shell().info("\n" <> String.duplicate("━", 60))
@@ -1145,7 +1137,7 @@ defmodule Mix.Tasks.ReqLlm.ModelCompat do
     end
   end
 
-  defp print_model_with_status(model, provider, state) do
+  defp print_model_with_status(model, provider, state, evidence, selected_operation) do
     model_spec = "#{provider}:#{model["id"]}"
     model_id = model["id"]
     has_fixtures = has_fixtures?(provider, model_id)
@@ -1175,8 +1167,38 @@ defmodule Mix.Tasks.ReqLlm.ModelCompat do
     tier_text =
       if model["tier"], do: " #{tier_color}(#{model["tier"]})#{IO.ANSI.reset()}", else: ""
 
-    Mix.shell().info("  #{status_icon} #{model["id"]}#{tier_text}")
+    support_text = evidence_support_text(evidence, provider, model, selected_operation)
+
+    Mix.shell().info("  #{status_icon} #{model["id"]}#{tier_text}#{support_text}")
   end
+
+  defp evidence_support_text(nil, _provider, _model, _selected_operation), do: ""
+
+  defp evidence_support_text(evidence, provider, model, selected_operation) do
+    operation = support_operation(model, selected_operation)
+    model_spec = "#{provider}:#{model["id"]}"
+
+    declared? =
+      case LLMDB.model(model_spec) do
+        {:ok, resolved} -> ReqLLM.ModelOperation.supported?(resolved, operation)
+        _error -> false
+      end
+
+    support =
+      Evidence.support_status(evidence, model_spec, operation,
+        declared?: declared?,
+        as_of: DateTime.utc_now()
+      )
+
+    IO.ANSI.faint() <> " [support: #{support.tier}]" <> IO.ANSI.reset()
+  end
+
+  @doc false
+  def support_operation(model, :all) do
+    ReqLLM.ModelOperation.normalize(model["type"])
+  end
+
+  def support_operation(_model, selected_operation), do: selected_operation
 
   defp print_model_status(model, _spec, status) do
     tier_color =
@@ -1525,66 +1547,33 @@ defmodule Mix.Tasks.ReqLlm.ModelCompat do
   defp save_scenario_state(results, run_ts, opts) do
     priv_dir = :code.priv_dir(:req_llm)
     path = Path.join(priv_dir, "model_compat_scenarios.json")
-
-    existing =
-      case File.read(path) do
-        {:ok, content} -> Jason.decode!(content)
-        _ -> %{}
-      end
-
-    ts = DateTime.to_iso8601(run_ts)
     mode = if opts[:record_all] || opts[:record], do: "record", else: "replay"
 
+    surface_resolver = fn model_spec, operation, fixtures ->
+      Evidence.fixture_surface(fixture_path_root(), model_spec, operation, fixtures)
+    end
+
+    existing =
+      case Evidence.load(path, surface_resolver: surface_resolver) do
+        {:ok, evidence} ->
+          evidence
+
+        {:error, :enoent} ->
+          Evidence.migrate(%{})
+
+        {:error, reason} ->
+          raise ArgumentError, "cannot load compatibility evidence: #{inspect(reason)}"
+      end
+
     new_state =
-      Enum.reduce(results, existing, fn result, acc ->
-        scenarios = Map.get(result, :scenarios) || scenario_entries_for_result(result)
+      Evidence.record(existing, results, run_ts, mode, surface_resolver: surface_resolver)
 
-        Enum.reduce(scenarios, acc, fn scenario, scenario_acc ->
-          put_scenario_state(scenario_acc, result.model_spec, scenario, ts, mode)
-        end)
-      end)
-
-    json = Jason.encode!(new_state, pretty: true)
+    json = Evidence.canonical_json(new_state)
 
     case File.read(path) do
       {:ok, prev} when prev == json -> :ok
       _ -> File.write!(path, json)
     end
-  end
-
-  defp scenario_entries_for_result(%{scenario: nil}), do: []
-
-  defp scenario_entries_for_result(result) do
-    [
-      %{
-        "scenario" => result.scenario,
-        "status" => Atom.to_string(result.status),
-        "fixtures" => result.fixtures,
-        "error" => result.error
-      }
-    ]
-  end
-
-  defp put_scenario_state(state, model_spec, scenario, ts, mode) do
-    scenario_name = scenario["scenario"]
-
-    model_state =
-      state
-      |> Map.get(model_spec, %{})
-      |> Map.put_new("scenarios", %{})
-
-    scenario_state = %{
-      "status" => scenario["status"],
-      "last_checked" => ts,
-      "mode" => mode,
-      "fixtures" => scenario["fixtures"] || [],
-      "error" => scenario["error"]
-    }
-
-    updated_model_state =
-      put_in(model_state, ["scenarios", scenario_name], scenario_state)
-
-    Map.put(state, model_spec, updated_model_state)
   end
 
   defp build_sorted_json(state) do

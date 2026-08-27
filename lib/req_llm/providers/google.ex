@@ -83,6 +83,8 @@ defmodule ReqLLM.Providers.Google do
 
   require Logger
 
+  @thinking_level_ranks %{minimal: 0, low: 1, medium: 2, high: 3}
+
   @provider_schema [
     google_api_version: [
       type: {:in, ["v1", "v1beta"]},
@@ -587,7 +589,10 @@ defmodule ReqLLM.Providers.Google do
     request
     # Google uses query parameter for API key, not Authorization header
     |> Req.Request.register_options(extra_option_keys)
-    |> Req.Request.merge_options([model: model.id, params: [key: api_key]] ++ req_opts)
+    |> Req.Request.merge_options(
+      ReqLLM.Provider.Defaults.finch_option(request) ++
+        [model: model.id, params: [key: api_key]] ++ req_opts
+    )
     |> ReqLLM.Step.Error.attach()
     |> ReqLLM.Step.Retry.attach(user_opts)
     |> Req.Request.prepend_request_steps(llm_encode_body: &__MODULE__.encode_body/1)
@@ -764,7 +769,7 @@ defmodule ReqLLM.Providers.Google do
               provider_opts
 
             :error ->
-              level = translate_reasoning_effort_to_level(effort_value)
+              level = translate_reasoning_effort_to_level(effort_value, model)
               Keyword.put(provider_opts, :google_thinking_level, level)
           end
 
@@ -811,48 +816,129 @@ defmodule ReqLLM.Providers.Google do
 
   defp normalize_response_modality(modality), do: modality
 
-  defp translate_reasoning_effort_to_budget(:none, _model), do: 0
-  defp translate_reasoning_effort_to_budget(:minimal, _model), do: 2_048
-  defp translate_reasoning_effort_to_budget(:low, _model), do: 4_096
-  defp translate_reasoning_effort_to_budget(:medium, _model), do: 8_192
-  defp translate_reasoning_effort_to_budget(:high, _model), do: 16_384
-  defp translate_reasoning_effort_to_budget(:xhigh, _model), do: 32_768
+  defp translate_reasoning_effort_to_budget(effort, _model) do
+    case ReqLLM.Provider.Reasoning.normalize_effort(effort) do
+      :none -> 0
+      :minimal -> 2_048
+      :low -> 4_096
+      :medium -> 8_192
+      :high -> 16_384
+      :xhigh -> 32_768
+      :max -> 32_768
+      budget when is_integer(budget) -> budget
+      _ -> 8_192
+    end
+  end
 
-  defp translate_reasoning_effort_to_budget("none", model),
-    do: translate_reasoning_effort_to_budget(:none, model)
+  defp translate_reasoning_effort_to_level(effort, model) do
+    effort
+    |> ReqLLM.Provider.Reasoning.normalize_effort()
+    |> case do
+      :none -> :minimal
+      :minimal -> :minimal
+      :low -> :low
+      :medium -> :medium
+      :high -> :high
+      :xhigh -> :high
+      :max -> :high
+      _ -> :medium
+    end
+    |> closest_supported_thinking_level(model)
+  end
 
-  defp translate_reasoning_effort_to_budget("minimal", model),
-    do: translate_reasoning_effort_to_budget(:minimal, model)
+  defp closest_supported_thinking_level(level, model) do
+    case supported_thinking_levels(model) do
+      [] ->
+        level
 
-  defp translate_reasoning_effort_to_budget("low", model),
-    do: translate_reasoning_effort_to_budget(:low, model)
+      supported_levels ->
+        requested_rank = Map.fetch!(@thinking_level_ranks, level)
 
-  defp translate_reasoning_effort_to_budget("medium", model),
-    do: translate_reasoning_effort_to_budget(:medium, model)
+        Enum.min_by(supported_levels, fn supported_level ->
+          supported_rank = Map.fetch!(@thinking_level_ranks, supported_level)
+          {abs(supported_rank - requested_rank), supported_rank}
+        end)
+    end
+  end
 
-  defp translate_reasoning_effort_to_budget("high", model),
-    do: translate_reasoning_effort_to_budget(:high, model)
+  defp supported_thinking_levels(%LLMDB.Model{} = model) do
+    [
+      get_nested(model.capabilities, [:reasoning, :effort, :values]),
+      extra_thinking_levels(model.extra),
+      known_thinking_levels(model)
+    ]
+    |> Enum.find_value([], fn levels ->
+      case normalize_thinking_levels(levels) do
+        [] -> nil
+        normalized -> normalized
+      end
+    end)
+  end
 
-  defp translate_reasoning_effort_to_budget("xhigh", model),
-    do: translate_reasoning_effort_to_budget(:xhigh, model)
+  defp supported_thinking_levels(_model), do: []
 
-  defp translate_reasoning_effort_to_budget(budget, _model) when is_integer(budget), do: budget
-  defp translate_reasoning_effort_to_budget(_unknown, _model), do: 8_192
+  defp extra_thinking_levels(extra) do
+    extra
+    |> get_nested([:reasoning_options])
+    |> List.wrap()
+    |> Enum.find_value([], fn option ->
+      case {get_nested(option, [:type]), get_nested(option, [:values])} do
+        {type, values} when type in ["effort", :effort] and is_list(values) and values != [] ->
+          values
 
-  defp translate_reasoning_effort_to_level(:none), do: :minimal
-  defp translate_reasoning_effort_to_level(:minimal), do: :minimal
-  defp translate_reasoning_effort_to_level(:low), do: :low
-  defp translate_reasoning_effort_to_level(:medium), do: :medium
-  defp translate_reasoning_effort_to_level(:high), do: :high
-  defp translate_reasoning_effort_to_level(:xhigh), do: :high
+        _ ->
+          nil
+      end
+    end)
+  end
 
-  defp translate_reasoning_effort_to_level("none"), do: :minimal
-  defp translate_reasoning_effort_to_level("minimal"), do: :minimal
-  defp translate_reasoning_effort_to_level("low"), do: :low
-  defp translate_reasoning_effort_to_level("medium"), do: :medium
-  defp translate_reasoning_effort_to_level("high"), do: :high
-  defp translate_reasoning_effort_to_level("xhigh"), do: :high
-  defp translate_reasoning_effort_to_level(_unknown), do: :medium
+  defp normalize_thinking_levels(levels) do
+    levels
+    |> List.wrap()
+    |> Enum.map(&ReqLLM.Provider.Reasoning.normalize_effort/1)
+    |> Enum.filter(&Map.has_key?(@thinking_level_ranks, &1))
+    |> Enum.uniq()
+  end
+
+  defp known_thinking_levels(%LLMDB.Model{} = model) do
+    [model.provider_model_id, model.model, model.id]
+    |> Enum.find_value([], &known_thinking_levels/1)
+  end
+
+  defp known_thinking_levels(model_id) when is_binary(model_id) do
+    model_name = google_model_name(model_id)
+
+    cond do
+      model_name_matches?(model_name, "gemini-3.7-flash") -> [:low, :medium, :high]
+      model_name_matches?(model_name, "gemini-3.1-pro") -> [:low, :medium, :high]
+      true -> nil
+    end
+  end
+
+  defp known_thinking_levels(_model_id), do: nil
+
+  defp model_name_matches?(model_name, base_name),
+    do: model_name == base_name or String.starts_with?(model_name, base_name <> "-")
+
+  defp google_model_name(model_id) do
+    model_id
+    |> String.split("/")
+    |> List.last()
+    |> String.split(":", parts: 2)
+    |> List.last()
+  end
+
+  defp get_nested(value, []), do: value
+
+  defp get_nested(value, [key | rest]) when is_map(value) do
+    cond do
+      Map.has_key?(value, key) -> get_nested(Map.get(value, key), rest)
+      Map.has_key?(value, to_string(key)) -> get_nested(Map.get(value, to_string(key)), rest)
+      true -> nil
+    end
+  end
+
+  defp get_nested(_value, _path), do: nil
 
   @impl ReqLLM.Provider
   def translate_options(:image, _model, opts) do
@@ -887,7 +973,7 @@ defmodule ReqLLM.Providers.Google do
           Keyword.put(opts, :google_thinking_budget, reasoning_budget)
 
         reasoning_effort && gemini_3_or_later?(model) ->
-          level = translate_reasoning_effort_to_level(reasoning_effort)
+          level = translate_reasoning_effort_to_level(reasoning_effort, model)
           Keyword.put(opts, :google_thinking_level, level)
 
         reasoning_effort ->
@@ -943,12 +1029,7 @@ defmodule ReqLLM.Providers.Google do
     {system_instruction, contents} =
       case request.options[:context] do
         %ReqLLM.Context{} = ctx ->
-          encoded =
-            ctx
-            |> normalize_context_video_urls()
-            |> ReqLLM.Provider.Defaults.encode_context_to_openai_format(model_name)
-
-          messages = encoded[:messages] || []
+          messages = encode_context_messages_for_gemini(ctx, model_name)
           split_messages_for_gemini(messages, model_name)
 
         _ ->
@@ -1125,12 +1206,7 @@ defmodule ReqLLM.Providers.Google do
       case request.options[:context] do
         %ReqLLM.Context{} = ctx ->
           # Convert OpenAI-style context to Gemini format
-          encoded =
-            ctx
-            |> normalize_context_video_urls()
-            |> ReqLLM.Provider.Defaults.encode_context_to_openai_format(model_name)
-
-          messages = encoded[:messages] || []
+          messages = encode_context_messages_for_gemini(ctx, model_name)
           split_messages_for_gemini(messages, model_name)
 
         _ ->
@@ -1218,12 +1294,7 @@ defmodule ReqLLM.Providers.Google do
     {system_instruction, contents} =
       case request.options[:context] do
         %ReqLLM.Context{} = ctx ->
-          encoded =
-            ctx
-            |> normalize_context_video_urls()
-            |> ReqLLM.Provider.Defaults.encode_context_to_openai_format(model_name)
-
-          messages = encoded[:messages] || []
+          messages = encode_context_messages_for_gemini(ctx, model_name)
           split_messages_for_gemini(messages, model_name)
 
         _ ->
@@ -1265,14 +1336,13 @@ defmodule ReqLLM.Providers.Google do
     |> maybe_put(:labels, request.options[:labels])
   end
 
-  defp gemini_3_or_later?(%LLMDB.Model{family: family}) when is_binary(family),
-    do: String.starts_with?(family, "gemini-3")
-
-  defp gemini_3_or_later?(%LLMDB.Model{id: id}) when is_binary(id),
-    do: String.starts_with?(id, "gemini-3")
+  defp gemini_3_or_later?(%LLMDB.Model{} = model) do
+    [model.provider_model_id, model.model, model.id, model.family]
+    |> Enum.any?(&gemini_3_or_later?/1)
+  end
 
   defp gemini_3_or_later?(id) when is_binary(id),
-    do: String.starts_with?(id, "gemini-3")
+    do: id |> google_model_name() |> String.starts_with?("gemini-3")
 
   defp gemini_3_or_later?(_), do: false
 
@@ -1472,10 +1542,13 @@ defmodule ReqLLM.Providers.Google do
                   }
               end
 
+            response_with_raw_finish =
+              put_raw_finish_provider_meta(response_with_grounding, body)
+
             merged_response =
               ReqLLM.Context.merge_response(
                 req.options[:context] || %ReqLLM.Context{messages: []},
-                response_with_grounding
+                response_with_raw_finish
               )
 
             {req, %{resp | body: merged_response}}
@@ -1786,6 +1859,12 @@ defmodule ReqLLM.Providers.Google do
             "finish_reason" => normalize_google_finish_reason(finish_reason)
           }
 
+        %{"finishReason" => finish_reason} when is_binary(finish_reason) ->
+          %{
+            "message" => %{"role" => "assistant", "content" => ""},
+            "finish_reason" => normalize_google_finish_reason(finish_reason)
+          }
+
         _ ->
           %{
             "message" => %{"role" => "assistant", "content" => ""},
@@ -1802,6 +1881,32 @@ defmodule ReqLLM.Providers.Google do
 
   defp convert_google_to_openai_format(body) when is_map(body), do: body
   defp convert_google_to_openai_format(_body), do: %{}
+
+  # Non-streaming counterpart of put_raw_finish_meta/3. Normalization collapses
+  # the abort reasons into "error" (or, before the clause above, into "stop"),
+  # so without this the caller cannot tell UNEXPECTED_TOOL_CALL from any other
+  # failure on this path — the streaming path has carried the raw value since
+  # the finish-reason-preservation commit.
+  defp put_raw_finish_provider_meta(%ReqLLM.Response{} = response, body) when is_map(body) do
+    case body do
+      %{"candidates" => [%{"finishReason" => raw} | _]} when is_binary(raw) ->
+        meta = Map.put(response.provider_meta, "finish_reason_raw", raw)
+
+        meta =
+          case body do
+            %{"candidates" => [%{"finishMessage" => message} | _]} when is_binary(message) ->
+              Map.put(meta, "finish_message", message)
+
+            _ ->
+              meta
+          end
+
+        %{response | provider_meta: meta}
+
+      _ ->
+        response
+    end
+  end
 
   defp convert_google_json_mode_to_openai_format(%{"candidates" => candidates} = body) do
     choice =
@@ -1930,10 +2035,58 @@ defmodule ReqLLM.Providers.Google do
 
   defp attach_reasoning_details(response, _details), do: response
 
+  # Preserve the provider's original finishReason (and finishMessage, when
+  # present) alongside the normalized value. Normalization collapses every
+  # unrecognized reason (MALFORMED_FUNCTION_CALL, UNEXPECTED_TOOL_CALL,
+  # OTHER, ...) into "error", which makes provider failures undiagnosable
+  # downstream.
+  defp put_raw_finish_meta(meta, finish_reason, data) do
+    finish_message =
+      case data do
+        %{"candidates" => [%{"finishMessage" => message} | _]} when is_binary(message) -> message
+        _ -> nil
+      end
+
+    meta
+    |> Map.put(:finish_reason_raw, finish_reason)
+    |> then(fn m ->
+      if finish_message, do: Map.put(m, :finish_message, finish_message), else: m
+    end)
+  end
+
   defp normalize_google_finish_reason("STOP"), do: "stop"
   defp normalize_google_finish_reason("MAX_TOKENS"), do: "length"
   defp normalize_google_finish_reason("SAFETY"), do: "content_filter"
   defp normalize_google_finish_reason("RECITATION"), do: "content_filter"
+
+  # Gemini flags generated content under several names beyond SAFETY. The proto
+  # describes this whole group in the same words — "the response candidate
+  # content was flagged for ..." — so they are one outcome wearing different
+  # labels and normalize the same way. Collapsing them into "error" instead
+  # makes a deterministic, non-retryable stop look like a transient provider
+  # fault, which callers then retry pointlessly.
+  #
+  # Source of truth is the FinishReason enum in googleapis/googleapis
+  # (google/ai/generativelanguage/v1beta/generative_service.proto). Cross-check
+  # both generated clients before adding names: the public REST reference omits
+  # the IMAGE_* values, and google-genai's Python types omit
+  # TOO_MANY_TOOL_CALLS, so neither is complete on its own.
+  #
+  # Deliberately NOT mapped here, because they are not content flags and want
+  # different handling than "the model refused": UNEXPECTED_TOOL_CALL (a tool
+  # call with no tools enabled in the request — a request-construction fault),
+  # TOO_MANY_TOOL_CALLS (the system aborted a tool-call runaway), NO_IMAGE /
+  # IMAGE_OTHER, and OTHER. Retrying most of these is equally futile, but they
+  # need a non-retryable non-refusal classification that does not exist yet, so
+  # they keep the existing "error" behaviour rather than borrow the wrong one.
+  defp normalize_google_finish_reason("BLOCKLIST"), do: "content_filter"
+  defp normalize_google_finish_reason("PROHIBITED_CONTENT"), do: "content_filter"
+  defp normalize_google_finish_reason("SPII"), do: "content_filter"
+  defp normalize_google_finish_reason("LANGUAGE"), do: "content_filter"
+  defp normalize_google_finish_reason("IMAGE_SAFETY"), do: "content_filter"
+  defp normalize_google_finish_reason("IMAGE_PROHIBITED_CONTENT"), do: "content_filter"
+  defp normalize_google_finish_reason("IMAGE_RECITATION"), do: "content_filter"
+
   defp normalize_google_finish_reason("OTHER"), do: "error"
   defp normalize_google_finish_reason(_), do: "error"
 
@@ -2117,6 +2270,132 @@ defmodule ReqLLM.Providers.Google do
     end
   end
 
+  defp encode_context_messages_for_gemini(%ReqLLM.Context{} = ctx, model_name) do
+    normalized_context = normalize_context_video_urls(ctx)
+
+    encoded =
+      ReqLLM.Provider.Defaults.encode_context_to_openai_format(normalized_context, model_name)
+
+    encoded
+    |> Map.get(:messages, [])
+    |> preserve_tool_call_metadata_in_messages(normalized_context)
+    |> preserve_provider_file_metadata_in_messages(normalized_context)
+  end
+
+  defp preserve_provider_file_metadata_in_messages(messages, %ReqLLM.Context{
+         messages: context_messages
+       }) do
+    owned_files =
+      context_messages
+      |> Enum.flat_map(fn message -> List.wrap(message.content) end)
+      |> Enum.reduce(%{}, fn part, acc ->
+        case ReqLLM.ProviderFileReference.reference_id(part, :google) do
+          {:ok, reference_id} ->
+            Map.put(acc, reference_id, %{media_type: part.media_type})
+
+          :error ->
+            acc
+        end
+      end)
+
+    Enum.map(messages, &preserve_message_provider_files(&1, owned_files))
+  end
+
+  defp preserve_message_provider_files(message, owned_files) when map_size(owned_files) == 0,
+    do: message
+
+  defp preserve_message_provider_files(%{content: content} = message, owned_files)
+       when is_list(content) do
+    %{message | content: Enum.map(content, &preserve_provider_file(&1, owned_files))}
+  end
+
+  defp preserve_message_provider_files(message, _owned_files), do: message
+
+  defp preserve_provider_file(%{type: "file", file: %{file_id: file_id}} = part, owned_files) do
+    case Map.get(owned_files, file_id) do
+      nil -> part
+      metadata -> Map.put(part, :req_llm_provider_file, metadata)
+    end
+  end
+
+  defp preserve_provider_file(part, _owned_files), do: part
+
+  defp preserve_tool_call_metadata_in_messages(messages, %ReqLLM.Context{
+         messages: context_messages
+       }) do
+    metadata_by_id =
+      context_messages
+      |> Enum.flat_map(fn
+        %ReqLLM.Message{tool_calls: tool_calls} when is_list(tool_calls) -> tool_calls
+        _ -> []
+      end)
+      |> Enum.reduce(%{}, fn tool_call, acc ->
+        metadata = ReqLLM.ToolCall.metadata(tool_call)
+
+        case {tool_call_id(tool_call), metadata} do
+          {id, metadata} when is_binary(id) and id != "" and map_size(metadata) > 0 ->
+            Map.put(acc, id, metadata)
+
+          _ ->
+            acc
+        end
+      end)
+
+    Enum.map(messages, &preserve_message_tool_call_metadata(&1, metadata_by_id))
+  end
+
+  defp preserve_message_tool_call_metadata(message, metadata_by_id)
+       when map_size(metadata_by_id) == 0,
+       do: message
+
+  defp preserve_message_tool_call_metadata(%{tool_calls: tool_calls} = message, metadata_by_id)
+       when is_list(tool_calls) do
+    %{
+      message
+      | tool_calls: Enum.map(tool_calls, &preserve_tool_call_metadata(&1, metadata_by_id))
+    }
+  end
+
+  defp preserve_message_tool_call_metadata(
+         %{"tool_calls" => tool_calls} = message,
+         metadata_by_id
+       )
+       when is_list(tool_calls) do
+    %{
+      message
+      | "tool_calls" => Enum.map(tool_calls, &preserve_tool_call_metadata(&1, metadata_by_id))
+    }
+  end
+
+  defp preserve_message_tool_call_metadata(message, _metadata_by_id), do: message
+
+  defp preserve_tool_call_metadata(tool_call, metadata_by_id) do
+    case Map.get(metadata_by_id, tool_call_id(tool_call)) do
+      metadata when is_map(metadata) and map_size(metadata) > 0 ->
+        put_tool_call_metadata(tool_call, metadata)
+
+      _ ->
+        tool_call
+    end
+  end
+
+  defp put_tool_call_metadata(%{"function" => function} = tool_call, metadata)
+       when is_map(function) do
+    %{tool_call | "function" => Map.put(function, "metadata", metadata)}
+  end
+
+  defp put_tool_call_metadata(%{function: function} = tool_call, metadata)
+       when is_map(function) do
+    %{tool_call | function: Map.put(function, :metadata, metadata)}
+  end
+
+  defp put_tool_call_metadata(tool_call, _metadata), do: tool_call
+
+  defp tool_call_id(%ReqLLM.ToolCall{id: id}), do: id
+  defp tool_call_id(%{"id" => id}), do: id
+  defp tool_call_id(%{id: id}), do: id
+  defp tool_call_id(_), do: nil
+
   # Split messages into system instruction and contents for Google Gemini
   defp split_messages_for_gemini(messages, model) do
     {system_msgs, chat_msgs} =
@@ -2195,6 +2474,14 @@ defmodule ReqLLM.Providers.Google do
         nest_multimodal? ->
           []
 
+        tool_result? and is_list(raw_content) ->
+          raw_content
+          |> Enum.filter(&multimodal_part?/1)
+          |> Enum.map(&convert_content_part/1)
+
+        tool_result? ->
+          []
+
         is_binary(raw_content) ->
           [%{text: raw_content}]
 
@@ -2241,12 +2528,21 @@ defmodule ReqLLM.Providers.Google do
   defp multimodal_tool_result?(_), do: false
 
   defp multimodal_part?(%ReqLLM.Message.ContentPart{type: type})
-       when type in [:file, :image, :image_url],
+       when type in [:file, :image, :image_url, :video_url],
        do: true
 
-  defp multimodal_part?(%{type: type}) when type in [:file, :image, :image_url], do: true
-  defp multimodal_part?(%{type: type}) when type in ["file", "image", "image_url"], do: true
-  defp multimodal_part?(%{"type" => type}) when type in ["file", "image", "image_url"], do: true
+  defp multimodal_part?(%{type: type})
+       when type in [:file, :image, :image_url, :video_url],
+       do: true
+
+  defp multimodal_part?(%{type: type})
+       when type in ["file", "image", "image_url", "video_url"],
+       do: true
+
+  defp multimodal_part?(%{"type" => type})
+       when type in ["file", "image", "image_url", "video_url"],
+       do: true
+
   defp multimodal_part?(_), do: false
 
   # Gemini requires that consecutive messages with the same role are merged
@@ -2408,6 +2704,9 @@ defmodule ReqLLM.Providers.Google do
     output = ReqLLM.ToolResult.output_from_message(message)
 
     cond do
+      ReqLLM.ToolResult.explicit_content?(message) ->
+        %{content: extract_content_text(raw_content)}
+
       is_map(output) or is_list(output) ->
         output
 
@@ -2505,17 +2804,20 @@ defmodule ReqLLM.Providers.Google do
     end
   end
 
-  # Most specific patterns first (file, image, etc.) - for ContentPart structs
-  defp convert_content_part(%{type: :file, data: data, media_type: media_type})
-       when is_binary(data) do
-    encoded_data = Base.encode64(data)
+  defp convert_content_part(%{
+         type: "file",
+         file: %{file_id: reference_id},
+         req_llm_provider_file: metadata
+       }) do
+    build_file_data(metadata, reference_id)
+  end
 
-    %{
-      inline_data: %{
-        mime_type: media_type,
-        data: encoded_data
-      }
-    }
+  # Most specific patterns first (file, image, etc.) - for ContentPart structs
+  defp convert_content_part(%{type: :file} = part) do
+    case ReqLLM.ProviderFileReference.reference_id(part, :google) do
+      {:ok, reference_id} -> build_file_data(part, reference_id)
+      :error -> convert_legacy_file_content_part(part)
+    end
   end
 
   # Specific text patterns
@@ -2528,6 +2830,20 @@ defmodule ReqLLM.Providers.Google do
   defp convert_content_part(text) when is_binary(text), do: %{text: text}
 
   defp convert_content_part(part), do: %{text: to_string(part)}
+
+  defp convert_legacy_file_content_part(%{data: data, media_type: media_type})
+       when is_binary(data) do
+    encoded_data = Base.encode64(data)
+
+    %{
+      inline_data: %{
+        mime_type: media_type,
+        data: encoded_data
+      }
+    }
+  end
+
+  defp convert_legacy_file_content_part(part), do: %{text: to_string(part)}
 
   defp convert_url_content_part(part, url) do
     cond do
@@ -2644,12 +2960,14 @@ defmodule ReqLLM.Providers.Google do
       when finish_reason != nil ->
         chunks = extract_chunks_from_parts(parts)
 
-        meta = %{
-          usage: convert_google_usage_for_streaming(usage),
-          finish_reason: normalize_google_finish_reason(finish_reason),
-          model: model.id,
-          terminal?: true
-        }
+        meta =
+          %{
+            usage: convert_google_usage_for_streaming(usage),
+            finish_reason: normalize_google_finish_reason(finish_reason),
+            model: model.id,
+            terminal?: true
+          }
+          |> put_raw_finish_meta(finish_reason, data)
 
         meta = if provider_meta, do: Map.put(meta, :provider_meta, provider_meta), else: meta
         chunks ++ [ReqLLM.StreamChunk.meta(meta)]
@@ -2660,10 +2978,12 @@ defmodule ReqLLM.Providers.Google do
       when finish_reason != nil ->
         chunks = extract_chunks_from_parts(parts)
 
-        meta = %{
-          finish_reason: normalize_google_finish_reason(finish_reason),
-          terminal?: true
-        }
+        meta =
+          %{
+            finish_reason: normalize_google_finish_reason(finish_reason),
+            terminal?: true
+          }
+          |> put_raw_finish_meta(finish_reason, data)
 
         meta = if provider_meta, do: Map.put(meta, :provider_meta, provider_meta), else: meta
         chunks ++ [ReqLLM.StreamChunk.meta(meta)]
@@ -2693,22 +3013,26 @@ defmodule ReqLLM.Providers.Google do
         "usageMetadata" => usage
       }
       when finish_reason != nil ->
-        meta = %{
-          usage: convert_google_usage_for_streaming(usage),
-          finish_reason: normalize_google_finish_reason(finish_reason),
-          model: model.id,
-          terminal?: true
-        }
+        meta =
+          %{
+            usage: convert_google_usage_for_streaming(usage),
+            finish_reason: normalize_google_finish_reason(finish_reason),
+            model: model.id,
+            terminal?: true
+          }
+          |> put_raw_finish_meta(finish_reason, data)
 
         meta = if provider_meta, do: Map.put(meta, :provider_meta, provider_meta), else: meta
         [ReqLLM.StreamChunk.meta(meta)]
 
       %{"candidates" => [%{"finishReason" => finish_reason} | _]}
       when finish_reason != nil ->
-        meta = %{
-          finish_reason: normalize_google_finish_reason(finish_reason),
-          terminal?: true
-        }
+        meta =
+          %{
+            finish_reason: normalize_google_finish_reason(finish_reason),
+            terminal?: true
+          }
+          |> put_raw_finish_meta(finish_reason, data)
 
         meta = if provider_meta, do: Map.put(meta, :provider_meta, provider_meta), else: meta
         [ReqLLM.StreamChunk.meta(meta)]

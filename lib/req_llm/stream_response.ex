@@ -32,6 +32,7 @@ defmodule ReqLLM.StreamResponse do
 
   text = ReqLLM.StreamResponse.text(stream_response)
   usage = ReqLLM.StreamResponse.usage(stream_response)
+  :ok = ReqLLM.StreamResponse.close(stream_response)
   ```
 
   ### Backward compatibility
@@ -52,8 +53,8 @@ defmodule ReqLLM.StreamResponse do
   |> Stream.each(&IO.write/1)
   |> Stream.run()
 
-  # Cancel remaining work
-  stream_response.cancel.()
+  # Cancel remaining work and close the metadata handle
+  ReqLLM.StreamResponse.close(stream_response)
   ```
 
   ## Design Philosophy
@@ -71,6 +72,7 @@ defmodule ReqLLM.StreamResponse do
   alias ReqLLM.Provider.ResponseBuilder
   alias ReqLLM.Response
   alias ReqLLM.Response.Stream, as: ResponseStream
+  alias ReqLLM.StreamResponse.EventProjector
   alias ReqLLM.StreamResponse.MetadataHandle
   alias ReqLLM.ToolCall
 
@@ -136,6 +138,46 @@ defmodule ReqLLM.StreamResponse do
     stream
     |> Stream.filter(&(&1.type == :content))
     |> Stream.map(& &1.text)
+  end
+
+  @doc """
+  Project the one consumable chunk stream into canonical tagged events.
+
+  This is a lazy view over `stream_response.stream`; it does not create or
+  buffer a second stream. Choose either the legacy chunk stream, `tokens/1`,
+  or `events/1` for a response because consuming one consumes the underlying
+  stream.
+
+  A fully consumed event stream starts with `:start` and ends with exactly one
+  `:finish`, `:cancelled`, or `:error` event. Output deltas and provider
+  extensions retain their arrival order. Final assembled tool calls, usage,
+  and warnings are emitted immediately before the terminal event. Early
+  enumeration halts the underlying stream and therefore cannot deliver a
+  terminal event to a consumer that has already stopped requesting values.
+
+  Provider and transport failures encountered by this projection are yielded
+  as terminal `:error` events. Consuming `stream_response.stream` directly or
+  through `tokens/1` retains the existing exception behavior.
+
+  `StreamResponse.stream` and every `StreamChunk` value remain unchanged in
+  ReqLLM 1.x.
+
+  ## Examples
+
+      {:ok, response} = ReqLLM.stream_text("openai:gpt-4o-mini", "Hello")
+
+      response
+      |> ReqLLM.StreamResponse.events()
+      |> Enum.each(fn
+        %ReqLLM.StreamEvent{type: :text_delta, data: text} -> IO.write(text)
+        %ReqLLM.StreamEvent{type: :error, data: error} -> IO.inspect(error)
+        _event -> :ok
+      end)
+
+  """
+  @spec events(t()) :: Enumerable.t()
+  def events(%__MODULE__{} = stream_response) do
+    EventProjector.events(stream_response)
   end
 
   @doc """
@@ -385,32 +427,20 @@ defmodule ReqLLM.StreamResponse do
   - The stream is consumed exactly once (no double-consumption bugs)
   - All callbacks are optional - omitted callbacks are simply not invoked
   - The returned Response struct contains all accumulated data plus metadata
+  - The metadata handle is closed before this function returns
   """
   @spec process_stream(t(), keyword()) :: {:ok, Response.t()} | {:error, term()}
   def process_stream(%__MODULE__{} = stream_response, opts \\ []) do
     callbacks = extract_callbacks(opts)
 
     chunks = process_stream_with_callbacks(stream_response.stream, callbacks)
-    metadata = MetadataHandle.await(stream_response.metadata_handle)
-
-    case metadata do
-      %{error: reason} ->
-        {:error, reason}
-
-      _ ->
-        builder = ResponseBuilder.for_model(stream_response.model)
-
-        builder.build_response(
-          chunks,
-          metadata,
-          context: stream_response.context,
-          model: stream_response.model
-        )
-    end
+    materialize_chunks(stream_response, chunks)
   rescue
     error -> {:error, error}
   catch
     :exit, reason -> {:error, reason}
+  after
+    MetadataHandle.stop(stream_response.metadata_handle)
   end
 
   # Process stream chunks, invoking callbacks and collecting chunks
@@ -534,6 +564,20 @@ defmodule ReqLLM.StreamResponse do
     end
   end
 
+  @doc """
+  Closes a streaming response and releases its resources.
+
+  This operation cancels any remaining stream work and terminates the metadata
+  handle. It is safe to call more than once. After closing, metadata accessors
+  such as `usage/1` and `finish_reason/1` are no longer available.
+  """
+  @spec close(t()) :: :ok
+  def close(%__MODULE__{cancel: cancel, metadata_handle: handle}) do
+    cancel.()
+  after
+    MetadataHandle.stop(handle)
+  end
+
   defp normalize_finish_reason(reason) when is_atom(reason) do
     case reason do
       :tool_use -> :tool_calls
@@ -601,26 +645,40 @@ defmodule ReqLLM.StreamResponse do
 
   This function materializes the entire stream and awaits metadata collection,
   so it negates the streaming benefits. Use this only when backward compatibility
-  is required.
+  is required. The metadata handle is closed before this function returns.
   """
   @spec to_response(t()) :: {:ok, Response.t()} | {:error, term()}
   def to_response(%__MODULE__{} = stream_response) do
-    # Consume stream and collect metadata
     chunks = Enum.to_list(stream_response.stream)
-    metadata = MetadataHandle.await(stream_response.metadata_handle)
-
-    # Use the appropriate ResponseBuilder for this model
-    builder = ResponseBuilder.for_model(stream_response.model)
-
-    builder.build_response(
-      chunks,
-      metadata,
-      context: stream_response.context,
-      model: stream_response.model
-    )
+    materialize_chunks(stream_response, chunks)
   rescue
     error -> {:error, error}
   catch
     :exit, reason -> {:error, reason}
+  after
+    MetadataHandle.stop(stream_response.metadata_handle)
+  end
+
+  defp materialize_chunks(stream_response, chunks) do
+    metadata = MetadataHandle.await(stream_response.metadata_handle)
+    {output_config, metadata} = ReqLLM.Output.Validation.pop_stream_config(metadata)
+
+    case metadata do
+      %{error: reason} ->
+        {:error, reason}
+
+      _metadata ->
+        builder = ResponseBuilder.for_model(stream_response.model)
+
+        result =
+          builder.build_response(
+            chunks,
+            metadata,
+            context: stream_response.context,
+            model: stream_response.model
+          )
+
+        ReqLLM.Output.Validation.finalize_stream_response(result, output_config)
+    end
   end
 end

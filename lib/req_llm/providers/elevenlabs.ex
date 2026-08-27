@@ -110,14 +110,13 @@ defmodule ReqLLM.Providers.ElevenLabs do
             base_url: Keyword.get(opts, :base_url, default_base_url()),
             params: [output_format: format_string],
             receive_timeout: timeout,
-            pool_timeout: timeout,
             body: Jason.encode!(body),
             decode_body: false
-          ] ++ http_opts
+          ] ++ ReqLLM.Provider.Defaults.merge_finch_options(http_opts, pool_timeout: timeout)
         )
         |> Req.Request.put_header("content-type", "application/json")
         |> Req.Request.put_header("xi-api-key", api_key)
-        |> ReqLLM.Step.Retry.attach()
+        |> ReqLLM.Step.Retry.attach(opts)
         |> ReqLLM.Step.Error.attach()
         |> ReqLLM.Step.Telemetry.attach(
           model,
@@ -162,12 +161,11 @@ defmodule ReqLLM.Providers.ElevenLabs do
             base_url: Keyword.get(opts, :base_url, default_base_url()),
             params: transcription_query_params(provider_options),
             receive_timeout: timeout,
-            pool_timeout: timeout,
             form_multipart: form_parts
-          ] ++ http_opts
+          ] ++ ReqLLM.Provider.Defaults.merge_finch_options(http_opts, pool_timeout: timeout)
         )
         |> Req.Request.put_header("xi-api-key", api_key)
-        |> ReqLLM.Step.Retry.attach()
+        |> ReqLLM.Step.Retry.attach(opts)
         |> ReqLLM.Step.Error.attach()
         |> ReqLLM.Step.Telemetry.attach(
           model,

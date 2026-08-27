@@ -36,6 +36,19 @@ defmodule ReqLLM.Provider.Options do
   end
   ```
 
+  Request options accept both the legacy flat provider container and an additive
+  provider-keyed form:
+
+  ```elixir
+  provider_options: [reasoning_summary: "auto"]
+  provider_options: [openai: [reasoning_summary: "auto"]]
+  ```
+
+  Namespaces use the selected ReqLLM provider identity. Hosted and compatible
+  providers therefore use names such as `:azure`, `:google_vertex`, and
+  `:openrouter`, rather than an upstream wire protocol such as `:openai` or
+  `:google`.
+
   ## Usage
 
   The main entry point is `process/4` which handles the complete pipeline:
@@ -130,7 +143,16 @@ defmodule ReqLLM.Provider.Options do
                                reasoning_effort: [
                                  type:
                                    {:in,
-                                    [:none, :minimal, :low, :medium, :high, :xhigh, :default]},
+                                    [
+                                      :none,
+                                      :minimal,
+                                      :low,
+                                      :medium,
+                                      :high,
+                                      :xhigh,
+                                      :max,
+                                      :default
+                                    ]},
                                  doc:
                                    "Computational effort for reasoning models (higher = more thinking)"
                                ],
@@ -148,10 +170,25 @@ defmodule ReqLLM.Provider.Options do
                                tool_choice: [
                                  type: {:or, [:string, :atom, :map]},
                                  doc:
-                                   "Tool selection strategy (auto, none, required, or specific)"
+                                   "Tool selection strategy (auto, none, required, or %{type: \"tool\", name: name})"
                                ],
 
                                # Output control
+                               output: [
+                                 type: :any,
+                                 doc:
+                                   "ReqLLM.Output descriptor for text, object, array, choice, or JSON generation"
+                               ],
+                               output_validation: [
+                                 type: {:in, [:compatible, :warn, :strict]},
+                                 doc:
+                                   "Final output validation policy; omission preserves compatible V1 behavior"
+                               ],
+                               output_repair: [
+                                 type: {:fun, 1},
+                                 doc:
+                                   "One-shot local callback for repairing an invalid complete structured output"
+                               ],
                                n: [
                                  type: :pos_integer,
                                  default: 1,
@@ -171,8 +208,20 @@ defmodule ReqLLM.Provider.Options do
 
                                # Provider-specific options container
                                provider_options: [
-                                 type: {:list, :any},
-                                 doc: "Provider-specific options (nested under this key)"
+                                 type: {:or, [:map, {:list, :any}]},
+                                 doc:
+                                   "Provider-specific options as a flat keyword/map or provider-keyed namespace"
+                               ],
+
+                               # Internal streaming orchestration options
+                               stream_transport: [
+                                 type: {:in, [:http, :websocket]},
+                                 doc: "Internal streaming transport selected by ReqLLM.Streaming"
+                               ],
+                               defer_http_events_until_telemetry?: [
+                                 type: :boolean,
+                                 doc:
+                                   "Internal streaming flag used by ReqLLM.Streaming telemetry coordination"
                                ],
 
                                # Streaming request hook
@@ -198,11 +247,26 @@ defmodule ReqLLM.Provider.Options do
                                    "ReqLLM telemetry options. Currently supports [payloads: :none | :raw]"
                                ],
 
-                               # HTTP client options
-                               receive_timeout: [
+                               # Transport options
+                               connect_timeout: [
                                  type: :pos_integer,
                                  doc:
-                                   "Timeout for receiving HTTP responses in milliseconds (defaults to global config)"
+                                   "Timeout for establishing WebSocket connections in milliseconds"
+                               ],
+                               receive_timeout: [
+                                 type: {:or, [:pos_integer, {:in, [:infinity]}]},
+                                 doc:
+                                   "Timeout for receiving provider data in milliseconds, or :infinity"
+                               ],
+                               total_timeout: [
+                                 type: {:or, [:pos_integer, {:in, [:infinity]}]},
+                                 doc:
+                                   "Optional total model-call timeout in milliseconds, including retries"
+                               ],
+                               stream_idle_timeout: [
+                                 type: {:or, [:pos_integer, {:in, [:infinity]}]},
+                                 doc:
+                                   "Optional timeout between semantic streaming updates in milliseconds"
                                ],
                                max_retries: [
                                  type: :non_neg_integer,
@@ -301,6 +365,11 @@ defmodule ReqLLM.Provider.Options do
   @spec process!(module(), atom(), LLMDB.Model.t(), keyword()) :: keyword()
   def process!(provider_mod, operation, model, opts) do
     {internal_opts, user_opts} = Keyword.split(opts, @internal_keys)
+
+    {user_opts, namespace_warnings} =
+      ReqLLM.Provider.Options.Namespace.normalize!(provider_mod, operation, model, user_opts)
+
+    user_opts = normalize_flat_provider_options!(provider_mod, user_opts)
     user_opts = handle_stream_alias(user_opts)
     user_opts = normalize_legacy_options(user_opts)
 
@@ -313,19 +382,32 @@ defmodule ReqLLM.Provider.Options do
     # Auto-hoist provider-specific top-level options into :provider_options
     user_opts = auto_hoist_provider_options(provider_mod, user_opts)
 
+    reasoning_advisory_options = flatten_options_for_advisories(user_opts)
+
     telemetry_original_opts =
       user_opts
       |> Keyword.merge(Keyword.take(internal_opts, [:telemetry, :context, :text, :operation]))
 
     # Apply pre-validation normalization (allows providers to filter/map unsupported options)
-    user_opts = apply_pre_validation(provider_mod, operation, model, user_opts)
+    {user_opts, prevalidation_warnings} =
+      apply_pre_validation(provider_mod, operation, model, user_opts)
 
     schema = compose_schema_internal(base_schema_for_operation(operation), provider_mod)
     validated_opts = NimbleOptions.validate!(user_opts, schema)
 
     {provider_options, standard_opts} = Keyword.pop(validated_opts, :provider_options, [])
     flattened_for_translation = Keyword.merge(standard_opts, provider_options)
-    translated_opts = apply_translation(provider_mod, operation, model, flattened_for_translation)
+
+    {translated_opts, translation_warnings, translation_replaced_warnings?} =
+      apply_translation(provider_mod, operation, model, flattened_for_translation)
+
+    reasoning_advisories =
+      ReqLLM.Provider.Reasoning.advisories(
+        provider_mod,
+        model,
+        reasoning_advisory_options,
+        translated_opts
+      )
 
     final_opts =
       if provider_options == [] do
@@ -341,7 +423,21 @@ defmodule ReqLLM.Provider.Options do
         end
       end
 
-    final_opts = handle_warnings(final_opts, opts)
+    callback_warnings = namespace_warnings ++ prevalidation_warnings ++ translation_warnings
+
+    enforceable_warnings =
+      if translation_replaced_warnings?,
+        do: namespace_warnings ++ translation_warnings,
+        else: callback_warnings
+
+    final_opts =
+      handle_warnings(
+        final_opts,
+        opts,
+        callback_warnings,
+        enforceable_warnings,
+        reasoning_advisories
+      )
 
     final_opts =
       final_opts
@@ -381,7 +477,31 @@ defmodule ReqLLM.Provider.Options do
     @generation_options_schema.schema |> Keyword.keys()
   end
 
+  @doc false
+  @spec normalize_namespaced_provider_options(module(), atom(), LLMDB.Model.t(), keyword()) ::
+          {:ok, keyword()} | {:error, Exception.t()}
+  def normalize_namespaced_provider_options(provider_mod, operation, model, opts) do
+    case ReqLLM.Provider.Options.Namespace.normalize(provider_mod, operation, model, opts) do
+      {:ok, normalized, warnings} ->
+        log_warnings(warnings)
+        {:ok, normalized}
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  @doc false
+  @spec normalize_flat_provider_options(module(), keyword()) ::
+          {:ok, keyword()} | {:error, Exception.t()}
+  def normalize_flat_provider_options(provider_mod, opts) do
+    {:ok, normalize_flat_provider_options!(provider_mod, opts)}
+  rescue
+    error -> {:error, error}
+  end
+
   defp base_schema_for_operation(:image), do: ReqLLM.Images.schema()
+  defp base_schema_for_operation(:video), do: ReqLLM.Video.schema()
 
   defp base_schema_for_operation(:embedding) do
     embedding_schema = ReqLLM.Embedding.schema()
@@ -604,9 +724,66 @@ defmodule ReqLLM.Provider.Options do
   defp normalize_legacy_options(opts) do
     opts
     |> normalize_stop_sequences()
-    |> normalize_legacy_reasoning()
+    |> ReqLLM.Provider.Reasoning.normalize_options()
     |> normalize_req_http_options()
     |> normalize_tools()
+  end
+
+  defp normalize_flat_provider_options!(provider_mod, opts) do
+    case Keyword.fetch(opts, :provider_options) do
+      {:ok, provider_options} when is_map(provider_options) ->
+        normalized = normalize_provider_option_map!(provider_mod, provider_options)
+        Keyword.put(opts, :provider_options, normalized)
+
+      _other ->
+        opts
+    end
+  end
+
+  defp normalize_provider_option_map!(provider_mod, provider_options) do
+    schema_keys =
+      if function_exported?(provider_mod, :provider_schema, 0) do
+        provider_mod.provider_schema().schema |> Keyword.keys()
+      else
+        []
+      end
+
+    schema_names = Map.new(schema_keys, &{Atom.to_string(&1), &1})
+
+    provider_options
+    |> Enum.map(fn
+      {key, value} when is_atom(key) ->
+        {key, value}
+
+      {key, value} when is_binary(key) ->
+        case Map.fetch(schema_names, key) do
+          {:ok, normalized_key} ->
+            {normalized_key, value}
+
+          :error ->
+            raise ReqLLM.Error.Invalid.Parameter.exception(
+                    parameter: "unknown string provider option #{inspect(key)}"
+                  )
+        end
+
+      {key, _value} ->
+        raise ReqLLM.Error.Invalid.Parameter.exception(
+                parameter: "invalid provider option key #{inspect(key)}"
+              )
+    end)
+    |> reject_normalized_map_collisions!()
+  end
+
+  defp reject_normalized_map_collisions!(provider_options) do
+    keys = Keyword.keys(provider_options)
+
+    if length(keys) == MapSet.size(MapSet.new(keys)) do
+      provider_options
+    else
+      raise ReqLLM.Error.Invalid.Parameter.exception(
+              parameter: "provider_options map contains duplicate atom/string option names"
+            )
+    end
   end
 
   defp extract_model_options(%LLMDB.Model{} = model, opts) do
@@ -617,6 +794,7 @@ defmodule ReqLLM.Provider.Options do
   defp maybe_extract_model_options(:image, _model, opts), do: opts
   defp maybe_extract_model_options(:embedding, _model, opts), do: opts
   defp maybe_extract_model_options(:rerank, _model, opts), do: opts
+  defp maybe_extract_model_options(:video, _model, opts), do: opts
 
   defp maybe_extract_model_options(_operation, model, opts),
     do: extract_model_options(model, opts)
@@ -673,69 +851,6 @@ defmodule ReqLLM.Provider.Options do
     case Keyword.pop(opts, :stop_sequences) do
       {nil, rest} -> rest
       {sequences, rest} -> Keyword.put(rest, :stop, sequences)
-    end
-  end
-
-  defp normalize_legacy_reasoning(opts) do
-    opts
-    |> normalize_thinking_flag()
-    |> normalize_reasoning_flag()
-  end
-
-  defp normalize_thinking_flag(opts) do
-    case Keyword.pop(opts, :thinking) do
-      {nil, rest} ->
-        rest
-
-      {false, rest} ->
-        rest
-
-      {true, rest} ->
-        rest
-
-      {thinking, rest} when is_map(thinking) ->
-        Keyword.put(rest, :thinking, thinking)
-    end
-  end
-
-  defp normalize_reasoning_flag(opts) do
-    case Keyword.pop(opts, :reasoning) do
-      {nil, rest} ->
-        rest
-
-      {false, rest} ->
-        rest
-
-      {true, rest} ->
-        rest
-        |> Keyword.put_new(:reasoning_effort, :medium)
-
-      {"auto", rest} ->
-        rest
-
-      {"none", rest} ->
-        rest
-        |> Keyword.put_new(:reasoning_effort, :none)
-
-      {"minimal", rest} ->
-        rest
-        |> Keyword.put_new(:reasoning_effort, :minimal)
-
-      {"low", rest} ->
-        rest
-        |> Keyword.put_new(:reasoning_effort, :low)
-
-      {"medium", rest} ->
-        rest
-        |> Keyword.put_new(:reasoning_effort, :medium)
-
-      {"high", rest} ->
-        rest
-        |> Keyword.put_new(:reasoning_effort, :high)
-
-      {"xhigh", rest} ->
-        rest
-        |> Keyword.put_new(:reasoning_effort, :xhigh)
     end
   end
 
@@ -804,19 +919,29 @@ defmodule ReqLLM.Provider.Options do
     end
   end
 
+  defp flatten_options_for_advisories(opts) do
+    case Keyword.pop(opts, :provider_options, []) do
+      {provider_options, standard_options} when is_list(provider_options) ->
+        if Keyword.keyword?(provider_options),
+          do: Keyword.merge(standard_options, provider_options),
+          else: standard_options
+
+      {_provider_options, standard_options} ->
+        standard_options
+    end
+  end
+
   defp apply_pre_validation(provider_mod, operation, model, opts) do
     if function_exported?(provider_mod, :pre_validate_options, 3) do
       case provider_mod.pre_validate_options(operation, model, opts) do
         {normalized_opts, warnings} when is_list(warnings) ->
-          existing_warnings = Process.get(:req_llm_warnings, [])
-          Process.put(:req_llm_warnings, existing_warnings ++ warnings)
-          normalized_opts
+          {normalized_opts, warnings}
 
         normalized_opts ->
-          normalized_opts
+          {normalized_opts, []}
       end
     else
-      opts
+      {opts, []}
     end
   end
 
@@ -824,42 +949,56 @@ defmodule ReqLLM.Provider.Options do
     if function_exported?(provider_mod, :translate_options, 3) do
       case provider_mod.translate_options(operation, model, opts) do
         {translated_opts, warnings} when is_list(warnings) ->
-          Process.put(:req_llm_warnings, warnings)
-          translated_opts
+          {translated_opts, warnings, true}
 
         translated_opts ->
-          translated_opts
+          {translated_opts, [], false}
       end
     else
-      opts
+      {opts, [], false}
     end
   end
 
-  defp handle_warnings(opts, original_opts) do
-    warnings = Process.get(:req_llm_warnings, [])
-    Process.delete(:req_llm_warnings)
+  defp handle_warnings(
+         opts,
+         original_opts,
+         callback_warnings,
+         enforceable_warnings,
+         reasoning_advisories
+       ) do
+    advisory_messages = ReqLLM.Provider.Reasoning.messages(reasoning_advisories)
+    all_warnings = callback_warnings ++ advisory_messages
 
-    if warnings == [] do
+    if all_warnings == [] do
       opts
     else
       case Keyword.get(original_opts, :on_unsupported, :warn) do
         :warn ->
-          Enum.each(warnings, fn warning ->
-            require Logger
-
-            Logger.warning(warning)
-          end)
+          log_warnings(all_warnings)
 
           opts
 
         :error ->
-          reason = Enum.join(warnings, "; ")
-          raise ReqLLM.Error.Validation.Error.exception(reason: reason)
+          if enforceable_warnings == [] do
+            log_warnings(all_warnings)
+            opts
+          else
+            reason = Enum.join(enforceable_warnings, "; ")
+            raise ReqLLM.Error.Validation.Error.exception(reason: reason)
+          end
 
         :ignore ->
           opts
       end
     end
+  end
+
+  defp log_warnings(warnings) do
+    Enum.each(warnings, fn warning ->
+      require Logger
+
+      Logger.warning(warning)
+    end)
   end
 
   defp validate_context(opts, original_opts) do
@@ -920,7 +1059,7 @@ defmodule ReqLLM.Provider.Options do
     unknown_keys = extract_unknown_keys_from_opts(opts)
     provider_suggestions = get_provider_option_suggestions(provider_mod, unknown_keys)
 
-    output_related_keys = [:output, :mode, :schema_name, :schema_description, :enum]
+    output_related_keys = [:mode, :schema_name, :schema_description, :enum]
     has_output_options = Enum.any?(unknown_keys, &(&1 in output_related_keys))
 
     base_message = message
@@ -928,10 +1067,9 @@ defmodule ReqLLM.Provider.Options do
     base_message =
       if has_output_options do
         output_tip =
-          "Tip: The :output option and related options (:mode, :schema_name, :schema_description, :enum) are not yet supported. " <>
-            "For array/enum outputs, use Zoi to define your schema and convert it with ReqLLM.Schema.to_json/1, then pass it to generate_object/4. " <>
-            "This requires a provider that supports JSON Schema (e.g., OpenAI). " <>
-            "Example: array_schema = Zoi.array(Zoi.object(%{name: Zoi.string()})) |> ReqLLM.Schema.to_json()"
+          "Tip: Use the :output option with a ReqLLM.Output descriptor. " <>
+            "The legacy :mode, :schema_name, :schema_description, and :enum options are not supported. " <>
+            "Example: output: ReqLLM.Output.array(Zoi.object(%{name: Zoi.string()}), name: \"people\")"
 
         base_message <> "\n\n" <> output_tip
       else

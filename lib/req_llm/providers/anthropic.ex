@@ -144,6 +144,31 @@ defmodule ReqLLM.Providers.Anthropic do
 
       Example: %{max_uses: 3, allowed_domains: ["example.com"]}
       """
+    ],
+    code_execution: [
+      type: :map,
+      doc: """
+      Enable the code execution server tool (code_execution_20260521): the API
+      runs model-written code in a sandboxed container. This version's tool
+      description tells the model about the 90-second wall-clock limit per
+      Python cell in programmatic tool calling, so it budgets long-running
+      cells. Takes no configuration today; pass an empty map to enable. GA —
+      no beta header required.
+
+      Example: %{}
+      """
+    ],
+    anthropic_container: [
+      type: :string,
+      doc: """
+      Code-execution container id to reuse. REQUIRED when re-sending a
+      conversation whose last assistant message has pending tool uses from
+      code execution (a "pause_turn" cut) — the API rejects the request with
+      "container_id is required" otherwise. The id arrives on the paused
+      response as `provider_meta["container"]["id"]`.
+
+      Example: "container_011CPR8tS8vNy3aDrRwLxo6i"
+      """
     ]
   ]
 
@@ -181,9 +206,16 @@ defmodule ReqLLM.Providers.Anthropic do
   @reasoning_budget_xhigh 8_192
 
   @impl ReqLLM.Provider
+  def refresh_oauth_credentials(credentials, opts) do
+    ReqLLM.Providers.Anthropic.OAuth.refresh(credentials, opts)
+  end
+
+  @impl ReqLLM.Provider
   def prepare_request(:chat, model_spec, prompt, opts) do
     with {:ok, model} <- ReqLLM.model(model_spec),
          {:ok, context} <- ReqLLM.Context.normalize(prompt, opts),
+         operation = Keyword.get(opts, :operation, :chat),
+         {:ok, plan} <- ReqLLM.RequestPlan.build(model, operation, opts),
          opts_with_context = Keyword.put(opts, :context, context),
          {:ok, processed_opts} <-
            ReqLLM.Provider.Options.process(__MODULE__, :chat, model, opts_with_context) do
@@ -206,17 +238,17 @@ defmodule ReqLLM.Providers.Anthropic do
         Req.new(
           [
             base_url: base_url,
-            url: "/v1/messages",
+            url: request_path(plan),
             method: :post,
-            receive_timeout: timeout,
-            pool_timeout: timeout
-          ] ++ http_opts
+            receive_timeout: timeout
+          ] ++ ReqLLM.Provider.Defaults.merge_finch_options(http_opts, pool_timeout: timeout)
         )
         |> Req.Request.register_options(req_keys)
         |> Req.Request.merge_options(
           Keyword.take(processed_opts, req_keys) ++ [model: get_api_model_id(model)]
         )
         |> attach(model, processed_opts)
+        |> Req.Request.put_private(:req_llm_request_plan, request_plan_metadata(plan))
 
       {:ok, request}
     end
@@ -523,8 +555,21 @@ defmodule ReqLLM.Providers.Anthropic do
     |> maybe_put(:stream, get_option(opts, :stream))
     |> Map.put(:max_tokens, max_tokens)
     |> maybe_add_tools(opts)
+    |> maybe_put_container(opts)
     |> maybe_apply_prompt_caching(opts)
     |> maybe_add_output_format(opts)
+  end
+
+  # A paused code-execution turn can only resume inside its original sandbox,
+  # so the container id from the paused response must ride the follow-up
+  # request as the top-level `container` parameter.
+  defp maybe_put_container(body, opts) do
+    provider_opts = get_option(opts, :provider_options, []) || []
+
+    case get_option(opts, :anthropic_container) || get_option(provider_opts, :container) do
+      id when is_binary(id) and id != "" -> Map.put(body, :container, id)
+      _ -> body
+    end
   end
 
   defp shape_subscription_body(body, %Req.Request{} = request) do
@@ -672,9 +717,9 @@ defmodule ReqLLM.Providers.Anthropic do
     |> binary_part(0, length)
   end
 
-  defp build_request_url(opts, credential) do
+  defp build_request_url(opts, credential, path) do
     base_url = get_option(opts, :base_url, base_url())
-    add_subscription_beta_query("#{base_url}/v1/messages", credential)
+    add_subscription_beta_query("#{base_url}#{path}", credential)
   end
 
   defp add_subscription_beta_query(url, {credential, opts}) do
@@ -717,56 +762,71 @@ defmodule ReqLLM.Providers.Anthropic do
   def attach_stream(model, context, opts, _finch_name) do
     operation = opts[:operation] || :chat
 
-    translated_opts =
-      ReqLLM.Provider.Options.process_stream!(
-        __MODULE__,
-        operation,
-        model,
-        context,
-        opts
-      )
+    with {:ok, plan} <-
+           ReqLLM.RequestPlan.build(model, operation, Keyword.put(opts, :stream, true)) do
+      translated_opts =
+        ReqLLM.Provider.Options.process_stream!(
+          __MODULE__,
+          operation,
+          model,
+          context,
+          opts
+        )
 
-    default_timeout =
-      if Keyword.has_key?(translated_opts, :thinking) do
-        Application.get_env(:req_llm, :thinking_timeout, 300_000)
-      else
-        Application.get_env(:req_llm, :receive_timeout, 120_000)
-      end
+      default_timeout =
+        if Keyword.has_key?(translated_opts, :thinking) do
+          Application.get_env(:req_llm, :thinking_timeout, 300_000)
+        else
+          Application.get_env(:req_llm, :receive_timeout, 120_000)
+        end
 
-    translated_opts = Keyword.put_new(translated_opts, :receive_timeout, default_timeout)
+      translated_opts = Keyword.put_new(translated_opts, :receive_timeout, default_timeout)
 
-    base_url = ReqLLM.Provider.Options.effective_base_url(__MODULE__, model, translated_opts)
-    translated_opts = Keyword.put(translated_opts, :base_url, base_url)
+      base_url = ReqLLM.Provider.Options.effective_base_url(__MODULE__, model, translated_opts)
+      translated_opts = Keyword.put(translated_opts, :base_url, base_url)
 
-    credential = ReqLLM.Auth.resolve!(model, translated_opts)
-    headers = build_request_headers(translated_opts, credential)
-    streaming_headers = [{"Accept", "text/event-stream"} | headers]
-    beta_headers = build_beta_headers(Keyword.put(translated_opts, :context, context), credential)
+      credential = ReqLLM.Auth.resolve!(model, translated_opts)
+      headers = build_request_headers(translated_opts, credential)
+      streaming_headers = [{"Accept", "text/event-stream"} | headers]
 
-    custom_headers =
-      ReqLLM.Provider.Utils.extract_custom_headers(translated_opts[:req_http_options])
+      beta_headers =
+        build_beta_headers(Keyword.put(translated_opts, :context, context), credential)
 
-    all_headers = streaming_headers ++ beta_headers ++ custom_headers
+      custom_headers =
+        ReqLLM.Provider.Utils.extract_custom_headers(translated_opts[:req_http_options])
 
-    context =
-      ReqLLM.ToolCallIdCompat.apply_context(
-        __MODULE__,
-        operation,
-        model,
-        context,
-        translated_opts
-      )
+      all_headers = streaming_headers ++ beta_headers ++ custom_headers
 
-    body =
-      context
-      |> build_request_body(get_api_model_id(model), translated_opts ++ [stream: true])
-      |> shape_subscription_body({credential, translated_opts})
+      context =
+        ReqLLM.ToolCallIdCompat.apply_context(
+          __MODULE__,
+          operation,
+          model,
+          context,
+          translated_opts
+        )
 
-    url = build_request_url(translated_opts, {credential, translated_opts})
+      body =
+        context
+        |> build_request_body(get_api_model_id(model), translated_opts ++ [stream: true])
+        |> shape_subscription_body({credential, translated_opts})
 
-    encoded = body |> ReqLLM.Schema.apply_property_ordering() |> Jason.encode!()
-    finch_request = Finch.build(:post, url, all_headers, encoded)
-    {:ok, finch_request}
+      url =
+        build_request_url(
+          translated_opts,
+          {credential, translated_opts},
+          request_path(plan)
+        )
+
+      encoded = body |> ReqLLM.Schema.apply_property_ordering() |> Jason.encode!()
+
+      finch_request =
+        :post
+        |> Finch.build(url, all_headers, encoded)
+        |> Finch.Request.put_private(:req_llm_request_plan, request_plan_metadata(plan))
+
+      {:ok, finch_request}
+    end
   rescue
     error ->
       {:error,
@@ -793,6 +853,28 @@ defmodule ReqLLM.Providers.Anthropic do
   @impl ReqLLM.Provider
   def flush_stream_state(model, state) do
     ReqLLM.Providers.Anthropic.Response.flush_stream_state(model, state)
+  end
+
+  defp request_plan_metadata(plan) do
+    Map.take(plan, [
+      :operation,
+      :provider,
+      :surface,
+      :transport,
+      :provider_module,
+      :api_module,
+      :warnings
+    ])
+  end
+
+  defp request_path(%ReqLLM.RequestPlan{
+         surface: :anthropic_messages,
+         api_module: __MODULE__
+       }),
+       do: "/v1/messages"
+
+  defp request_path(%ReqLLM.RequestPlan{model: model}) do
+    raise ReqLLM.Error.Invalid.Provider.exception(provider: model.provider)
   end
 
   @impl ReqLLM.Provider
@@ -897,7 +979,7 @@ defmodule ReqLLM.Providers.Anthropic do
     tools = Keyword.get(user_opts, :tools, [])
 
     server_tools? =
-      Enum.any?([:web_search, :web_fetch], fn key ->
+      Enum.any?([:web_search, :web_fetch, :code_execution], fn key ->
         is_map(get_option(user_opts, key) || get_option(provider_opts, key))
       end)
 
@@ -1155,6 +1237,9 @@ defmodule ReqLLM.Providers.Anthropic do
     web_fetch_config =
       get_option(options, :web_fetch) || get_option(provider_opts, :web_fetch)
 
+    code_execution_config =
+      get_option(options, :code_execution) || get_option(provider_opts, :code_execution)
+
     # Build the tools list
     formatted_tools =
       if is_list(tools) and tools != [],
@@ -1164,7 +1249,8 @@ defmodule ReqLLM.Providers.Anthropic do
     server_tools =
       [
         if(is_map(web_search_config), do: build_web_search_tool(web_search_config)),
-        if(is_map(web_fetch_config), do: build_web_fetch_tool(web_fetch_config))
+        if(is_map(web_fetch_config), do: build_web_fetch_tool(web_fetch_config)),
+        if(is_map(code_execution_config), do: build_code_execution_tool())
       ]
       |> Enum.reject(&is_nil/1)
 
@@ -1246,7 +1332,7 @@ defmodule ReqLLM.Providers.Anthropic do
   #     * `:user_location` - Map with keys: type, city, region, country, timezone
   defp build_web_search_tool(config) when is_map(config) do
     base_tool = %{
-      type: "web_search_20250305",
+      type: "web_search_20260209",
       name: "web_search"
     }
 
@@ -1296,6 +1382,11 @@ defmodule ReqLLM.Providers.Anthropic do
     |> maybe_put_server_tool_opt(:citations, get_server_tool_opt(config, :citations))
   end
 
+  # Builds the code execution tool definition; the tool takes no configuration.
+  defp build_code_execution_tool do
+    %{type: "code_execution_20260521", name: "code_execution"}
+  end
+
   defp get_server_tool_opt(config, key) do
     Map.get(config, key) || Map.get(config, Atom.to_string(key))
   end
@@ -1317,9 +1408,11 @@ defmodule ReqLLM.Providers.Anthropic do
   This is the canonical source of truth for Anthropic reasoning effort mappings,
   used by all providers hosting Anthropic models.
 
+  - `:minimal` → 512 tokens
   - `:low` → 1,024 tokens
   - `:medium` → 2,048 tokens
   - `:high` → 4,096 tokens
+  - `:xhigh` and `:max` → 8,192 tokens for legacy fixed-budget models
 
   ## Examples
 
@@ -1329,19 +1422,17 @@ defmodule ReqLLM.Providers.Anthropic do
       iex> ReqLLM.Providers.Anthropic.map_reasoning_effort_to_budget("medium")
       2048
   """
-  def map_reasoning_effort_to_budget(:none), do: nil
-  def map_reasoning_effort_to_budget(:minimal), do: @reasoning_budget_minimal
-  def map_reasoning_effort_to_budget(:low), do: @reasoning_budget_low
-  def map_reasoning_effort_to_budget(:medium), do: @reasoning_budget_medium
-  def map_reasoning_effort_to_budget(:high), do: @reasoning_budget_high
-  def map_reasoning_effort_to_budget(:xhigh), do: @reasoning_budget_xhigh
-  def map_reasoning_effort_to_budget("none"), do: map_reasoning_effort_to_budget(:none)
-  def map_reasoning_effort_to_budget("minimal"), do: map_reasoning_effort_to_budget(:minimal)
-  def map_reasoning_effort_to_budget("low"), do: map_reasoning_effort_to_budget(:low)
-  def map_reasoning_effort_to_budget("medium"), do: map_reasoning_effort_to_budget(:medium)
-  def map_reasoning_effort_to_budget("high"), do: map_reasoning_effort_to_budget(:high)
-  def map_reasoning_effort_to_budget("xhigh"), do: map_reasoning_effort_to_budget(:xhigh)
-  def map_reasoning_effort_to_budget(_), do: @reasoning_budget_medium
+  def map_reasoning_effort_to_budget(effort) do
+    case ReqLLM.Provider.Reasoning.normalize_effort(effort) do
+      :none -> nil
+      :minimal -> @reasoning_budget_minimal
+      :low -> @reasoning_budget_low
+      :medium -> @reasoning_budget_medium
+      :high -> @reasoning_budget_high
+      effort when effort in [:xhigh, :max] -> @reasoning_budget_xhigh
+      _ -> @reasoning_budget_medium
+    end
+  end
 
   defp translate_reasoning_effort(opts, model) do
     {reasoning_effort, opts} = Keyword.pop(opts, :reasoning_effort)
@@ -1365,6 +1456,9 @@ defmodule ReqLLM.Providers.Anthropic do
 
       :xhigh ->
         put_reasoning_effort(opts, model, :xhigh, reasoning_budget)
+
+      :max ->
+        put_reasoning_effort(opts, model, :max, reasoning_budget)
 
       :default ->
         put_default_reasoning_effort(opts, model)
@@ -1469,26 +1563,34 @@ defmodule ReqLLM.Providers.Anthropic do
   defp adaptive_effort(:low, _model), do: "low"
   defp adaptive_effort(:medium, _model), do: "medium"
   defp adaptive_effort(:high, _model), do: "high"
-  defp adaptive_effort(:xhigh, model), do: max_effort(model)
-  defp adaptive_effort(:default, _model), do: "medium"
 
-  defp max_effort(model) do
-    if max_effort_supported?(model) do
-      "max"
-    else
-      "high"
+  defp adaptive_effort(:xhigh, model) do
+    cond do
+      effort_supported?(model, :xhigh) -> "xhigh"
+      effort_supported?(model, :max) -> "max"
+      true -> "high"
     end
   end
 
-  defp max_effort_supported?(%LLMDB.Model{} = model) do
-    model_capability(model, [:reasoning, :effort, :values])
-    |> normalized_effort_values()
-    |> Enum.member?("max") or
-      model_extra(model, [:provider_capabilities, :effort, :max, :supported]) == true or
-      model_extra(model, [:capabilities, :effort, :max, :supported]) == true
+  defp adaptive_effort(:max, model) do
+    cond do
+      effort_supported?(model, :max) -> "max"
+      effort_supported?(model, :xhigh) -> "xhigh"
+      true -> "high"
+    end
   end
 
-  defp max_effort_supported?(_model), do: false
+  defp adaptive_effort(:default, _model), do: "medium"
+
+  defp effort_supported?(%LLMDB.Model{} = model, effort) do
+    model_capability(model, [:reasoning, :effort, :values])
+    |> normalized_effort_values()
+    |> Enum.member?(Atom.to_string(effort)) or
+      model_extra(model, [:provider_capabilities, :effort, effort, :supported]) == true or
+      model_extra(model, [:capabilities, :effort, effort, :supported]) == true
+  end
+
+  defp effort_supported?(_model, _effort), do: false
 
   defp normalized_effort_values(values) when is_list(values) do
     Enum.map(values, fn

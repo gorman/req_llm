@@ -1,6 +1,8 @@
 defmodule ReqLLM.GenerationTest do
   use ExUnit.Case, async: true
 
+  @moduletag contract: :public_api
+
   alias ReqLLM.{Context, Generation, Response, StreamResponse}
 
   @chat_model "openai:gpt-4-turbo"
@@ -94,6 +96,12 @@ defmodule ReqLLM.GenerationTest do
   defmodule ObjectStreamHTTP do
   end
 
+  defmodule SlowHTTP do
+  end
+
+  defmodule CacheWriteHTTP do
+  end
+
   setup do
     # Stub HTTP responses for testing
     Req.Test.stub(ReqLLM.GenerationTest, fn conn ->
@@ -126,6 +134,54 @@ defmodule ReqLLM.GenerationTest do
       assert response.model =~ "gpt-4-turbo"
       assert is_binary(Response.text(response))
       assert String.length(Response.text(response)) > 0
+    end
+
+    test "preserves OpenAI cache writes in response usage and billing" do
+      model = %LLMDB.Model{
+        provider: :openai,
+        id: "gpt-cache-write-test",
+        pricing:
+          ReqLLM.Test.Helpers.pricing_from_cost(%{
+            input: 1.0,
+            output: 2.0,
+            cache_read: 0.1,
+            cache_write: 0.2
+          })
+      }
+
+      Req.Test.stub(CacheWriteHTTP, fn conn ->
+        Req.Test.json(conn, %{
+          "id" => "chatcmpl-cache-write",
+          "model" => model.id,
+          "choices" => [
+            %{
+              "message" => %{"role" => "assistant", "content" => "Cached"},
+              "finish_reason" => "stop"
+            }
+          ],
+          "usage" => %{
+            "prompt_tokens" => 2_000,
+            "completion_tokens" => 10,
+            "total_tokens" => 2_010,
+            "prompt_tokens_details" => %{
+              "cached_tokens" => 1_200,
+              "cache_write_tokens" => 800
+            }
+          }
+        })
+      end)
+
+      assert {:ok, response} =
+               Generation.generate_text(model, "Hello",
+                 api_key: "test-key",
+                 req_http_options: [plug: {Req.Test, CacheWriteHTTP}]
+               )
+
+      assert response.usage.cached_tokens == 1_200
+      assert response.usage.cache_creation_tokens == 800
+      assert response.usage.input_cost == 0.00028
+      assert response.usage.output_cost == 0.00002
+      assert response.usage.total_cost == 0.0003
     end
 
     test "accepts Context input format" do
@@ -213,6 +269,57 @@ defmodule ReqLLM.GenerationTest do
   end
 
   describe "generate_text/3 error cases" do
+    test "enforces a total timeout across the Req lifecycle" do
+      conversation_id = "total-timeout-#{System.unique_integer([:positive])}"
+      handler_id = {__MODULE__, self(), make_ref()}
+
+      :ok =
+        :telemetry.attach_many(
+          handler_id,
+          [
+            [:req_llm, :request, :start],
+            [:req_llm, :request, :stop],
+            [:req_llm, :request, :exception]
+          ],
+          fn event, measurements, metadata, test_pid ->
+            if get_in(metadata, [:request_options, :conversation_id]) == conversation_id do
+              send(test_pid, {:timeout_telemetry, event, measurements, metadata})
+            end
+          end,
+          self()
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      Req.Test.stub(SlowHTTP, fn conn ->
+        Process.sleep(250)
+
+        Req.Test.json(conn, %{
+          "id" => "cmpl_too_late",
+          "model" => "gpt-4-turbo",
+          "choices" => [%{"message" => %{"role" => "assistant", "content" => "late"}}]
+        })
+      end)
+
+      assert {:error, %ReqLLM.Error.API.Timeout{kind: :total, timeout: 60}} =
+               Generation.generate_text(
+                 @chat_model,
+                 "Hello",
+                 total_timeout: 60,
+                 telemetry: [conversation_id: conversation_id],
+                 req_http_options: [plug: {Req.Test, SlowHTTP}]
+               )
+
+      assert_receive {:timeout_telemetry, [:req_llm, :request, :start], _, start_metadata}
+
+      assert_receive {:timeout_telemetry, [:req_llm, :request, :exception], _, exception_metadata}
+
+      assert start_metadata.request_id == exception_metadata.request_id
+      assert exception_metadata.finish_reason == :error
+      assert %ReqLLM.Error.API.Timeout{kind: :total} = exception_metadata.error
+      refute_received {:timeout_telemetry, [:req_llm, :request, :stop], _, _}
+    end
+
     test "returns error for invalid model spec" do
       assert {:error, :unknown_provider} = Generation.generate_text("invalid:model", "Hello")
     end
@@ -265,6 +372,7 @@ defmodule ReqLLM.GenerationTest do
                Generation.generate_text(
                  @chat_model,
                  "Hello",
+                 max_retries: 0,
                  req_http_options: [plug: {Req.Test, ErrorHTTP}]
                )
 
@@ -799,6 +907,18 @@ defmodule ReqLLM.GenerationTest do
           @chat_model,
           "Hello",
           frequency_penalty: 0.1,
+          req_http_options: [plug: {Req.Test, ReqLLM.GenerationTest}]
+        )
+
+      assert %Response{} = response
+    end
+
+    test "handles provider-keyed options through the public API" do
+      {:ok, response} =
+        Generation.generate_text(
+          @chat_model,
+          "Hello",
+          provider_options: [openai: [openai_logprobs: true]],
           req_http_options: [plug: {Req.Test, ReqLLM.GenerationTest}]
         )
 

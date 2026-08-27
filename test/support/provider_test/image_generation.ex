@@ -35,14 +35,18 @@ defmodule ReqLLM.ProviderTest.ImageGeneration do
 
         describe "#{model_spec}" do
           @tag category: :image
-          @tag scenario: :image_basic
+          @tag ReqLLM.Test.CompatibilityScenario.tag!(:image_basic)
           @tag model: model_spec |> String.split(":", parts: 2) |> List.last()
           test "basic image generation" do
             {:ok, response} =
               ReqLLM.generate_image(
                 @model_spec,
                 ReqLLM.ProviderTest.ImageGeneration.prompt(@provider),
-                fixture_opts(@provider, "image_basic", [])
+                fixture_opts(
+                  @provider,
+                  ReqLLM.Test.CompatibilityScenario.fixture!(:image_basic),
+                  ReqLLM.ProviderTest.ImageGeneration.provider_opts(@provider)
+                )
               )
 
             images = ReqLLM.Response.images(response)
@@ -71,4 +75,22 @@ defmodule ReqLLM.ProviderTest.ImageGeneration do
   def prompt(:google), do: "A simple blue square on a white background"
   def prompt(:xai), do: "A simple green square on a white background"
   def prompt(_provider), do: "A simple red square on a white background"
+
+  @azure_fixture_base_url "https://fixture.openai.azure.com/openai/v1"
+
+  @doc false
+  def provider_opts(:azure) do
+    opts =
+      case ReqLLM.Test.Env.fixtures_mode() do
+        :record -> []
+        :replay -> [api_key: "fixture-api-key", base_url: @azure_fixture_base_url]
+      end
+
+    case System.get_env("AZURE_IMAGE_DEPLOYMENT") do
+      nil -> opts
+      deployment -> Keyword.put(opts, :deployment, deployment)
+    end
+  end
+
+  def provider_opts(_provider), do: []
 end

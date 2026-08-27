@@ -50,6 +50,8 @@ end
 defmodule ReqLLM.ResponseTest do
   use ExUnit.Case, async: true
 
+  @moduletag contract: :public_api
+
   import ReqLLM.ResponseTest.Helpers
 
   alias ReqLLM.{Context, Error, Message, Message.ContentPart, Response, StreamChunk, ToolCall}
@@ -146,12 +148,32 @@ defmodule ReqLLM.ResponseTest do
 
     test "extracts from message.tool_calls field" do
       tool_calls = [
-        %{name: "get_weather", arguments: %{location: "NYC"}, id: "call-123"},
-        %{name: "calculate", arguments: %{expression: "2+2"}, id: "call-456"}
+        ToolCall.new("call-123", "get_weather", ~s({"location":"NYC"})),
+        ToolCall.new("call-456", "calculate", ~s({"expression":"2+2"}))
       ]
 
       response = create_response(message: tool_message(tool_calls))
       assert Response.tool_calls(response) == tool_calls
+    end
+
+    test "returns ToolCall structs with field access" do
+      response =
+        create_response(
+          message: tool_message([ToolCall.new("call-123", "get_weather", ~s({"location":"NYC"}))])
+        )
+
+      [tool_call] = Response.tool_calls(response)
+
+      assert tool_call.id == "call-123"
+      assert tool_call.function.name == "get_weather"
+
+      assert ToolCall.to_map(tool_call) == %{
+               id: "call-123",
+               name: "get_weather",
+               arguments: %{"location" => "NYC"}
+             }
+
+      assert_raise UndefinedFunctionError, fn -> tool_call[:id] end
     end
   end
 
@@ -331,6 +353,47 @@ defmodule ReqLLM.ResponseTest do
 
       assert {:ok, materialized} = Response.join_stream(response)
       assert materialized.message.content == [%{type: :text, text: ""}]
+    end
+
+    test "materializes generated images from streaming responses" do
+      image = ContentPart.image(<<1, 2, 3>>, "image/png")
+
+      response =
+        create_response(
+          message: nil,
+          stream?: true,
+          stream: [StreamChunk.content_part(image)]
+        )
+
+      assert {:ok, materialized} = Response.join_stream(response)
+      assert Response.images(materialized) == [image]
+    end
+
+    test "preserves image and text order in joined streaming responses" do
+      first_image = ContentPart.image(<<1>>, "image/png")
+      second_image = ContentPart.image(<<2>>, "image/png")
+
+      response =
+        create_response(
+          message: nil,
+          stream?: true,
+          stream: [
+            StreamChunk.content_part(first_image),
+            StreamChunk.text("First caption"),
+            StreamChunk.content_part(second_image),
+            StreamChunk.text("Second "),
+            StreamChunk.text("caption")
+          ]
+        )
+
+      assert {:ok, materialized} = Response.join_stream(response)
+
+      assert materialized.message.content == [
+               first_image,
+               ContentPart.text("First caption"),
+               second_image,
+               ContentPart.text("Second caption")
+             ]
     end
 
     test "returns error when stream consumption fails" do

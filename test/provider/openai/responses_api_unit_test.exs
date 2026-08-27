@@ -62,6 +62,44 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert body["stream"] == true
     end
 
+    test "encodes explicit prompt cache controls" do
+      breakpoint = %{mode: "explicit"}
+
+      context =
+        ReqLLM.Context.new([
+          ReqLLM.Context.user([
+            ReqLLM.Message.ContentPart.text("Stable text", %{
+              prompt_cache_breakpoint: breakpoint
+            }),
+            ReqLLM.Message.ContentPart.image_url("https://example.com/image.png", %{
+              "prompt_cache_breakpoint" => breakpoint
+            }),
+            ReqLLM.Message.ContentPart.file_id("file_123", %{
+              prompt_cache_breakpoint: breakpoint
+            })
+          ])
+        ])
+
+      request =
+        build_request(
+          context: context,
+          provider_options: [
+            prompt_cache_key: "tenant:acme:knowledge-v1",
+            prompt_cache_options: %{mode: "explicit", ttl: "30m"}
+          ]
+        )
+
+      body = request |> ResponsesAPI.encode_body() |> ReqLLM.Test.Helpers.json_body()
+
+      assert body["prompt_cache_key"] == "tenant:acme:knowledge-v1"
+      assert body["prompt_cache_options"] == %{"mode" => "explicit", "ttl" => "30m"}
+
+      assert [%{"content" => [text_block, image_block, file_block]}] = body["input"]
+      assert text_block["prompt_cache_breakpoint"] == %{"mode" => "explicit"}
+      assert image_block["prompt_cache_breakpoint"] == %{"mode" => "explicit"}
+      assert file_block["prompt_cache_breakpoint"] == %{"mode" => "explicit"}
+    end
+
     test "encodes tools when present" do
       tool =
         ReqLLM.Tool.new!(
@@ -128,6 +166,68 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert [encoded_tool] = body["tools"]
       assert encoded_tool["strict"] == true
       assert Enum.sort(encoded_tool["parameters"]["required"]) == ["location", "units"]
+    end
+
+    test "strictifies raw function tools with JSON schema placeholder parameters" do
+      tool = %{
+        "type" => "function",
+        "function" => %{
+          "name" => "websearch",
+          "description" => "Search the web",
+          "parameters" => %{
+            "type" => "object",
+            "required" => ["query"],
+            "properties" => %{
+              "query" => %{"type" => "string"},
+              "outputSchema" => %{
+                "description" => "JSON schema for synthesized output.content"
+              },
+              "summary" => %{
+                "anyOf" => [
+                  %{"type" => "boolean"},
+                  %{
+                    "type" => "object",
+                    "properties" => %{
+                      "schema" => %{
+                        "description" => "JSON schema for structured summary output"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+
+      request = build_request(tools: [tool])
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = ReqLLM.Test.Helpers.json_body(encoded)
+
+      assert [encoded_tool] = body["tools"]
+      assert encoded_tool["type"] == "function"
+      assert encoded_tool["name"] == "websearch"
+      assert encoded_tool["strict"] == true
+
+      params = encoded_tool["parameters"]
+      assert Enum.sort(params["required"]) == ["outputSchema", "query", "summary"]
+      assert params["additionalProperties"] == false
+
+      output_schema = params["properties"]["outputSchema"]
+      assert output_schema["description"] == "JSON schema for synthesized output.content"
+      assert output_schema["type"] == "object"
+      assert output_schema["properties"] == %{}
+      assert output_schema["required"] == []
+      assert output_schema["additionalProperties"] == false
+
+      [_, summary_object] = params["properties"]["summary"]["anyOf"]
+      nested_schema = summary_object["properties"]["schema"]
+      assert nested_schema["description"] == "JSON schema for structured summary output"
+      assert nested_schema["type"] == "object"
+      assert nested_schema["properties"] == %{}
+      assert nested_schema["required"] == []
+      assert nested_schema["additionalProperties"] == false
     end
 
     test "passes through code_interpreter tool maps unchanged" do
@@ -219,6 +319,31 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
              ] = body["input"]
     end
 
+    test "encodes explicitly owned OpenAI file references without ownership metadata" do
+      file_part =
+        ReqLLM.Message.ContentPart.owned_file_id("file-owned", :openai,
+          purpose: :assistants,
+          status: :processed
+        )
+
+      context = %ReqLLM.Context{
+        messages: [
+          %ReqLLM.Message{
+            role: :user,
+            content: [file_part]
+          }
+        ]
+      }
+
+      body = context |> then(&build_request(context: &1)) |> ResponsesAPI.encode_body()
+      decoded = ReqLLM.Test.Helpers.json_body(body)
+
+      assert [%{"content" => [%{"type" => "input_file", "file_id" => "file-owned"}]}] =
+               decoded["input"]
+
+      refute Jason.encode!(decoded) =~ "req_llm"
+    end
+
     test "omits tools when empty list" do
       request = build_request(tools: [])
 
@@ -290,6 +415,31 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert Jason.decode!(tool_output["output"]) == %{"temp" => 72}
     end
 
+    test "prefers explicit model-facing content over application output" do
+      tool_result =
+        ReqLLM.Context.tool_result(
+          "call_1",
+          "search_documents",
+          %ReqLLM.ToolResult{
+            output: %{records: [%{id: 1}], internal_cursor: "cursor_123"},
+            content: [ReqLLM.Message.ContentPart.text("One matching document was found.")]
+          }
+        )
+
+      context = %ReqLLM.Context{messages: [tool_result]}
+      request = build_request(context: context)
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = ReqLLM.Test.Helpers.json_body(encoded)
+
+      tool_output =
+        Enum.find(body["input"], fn item ->
+          item["type"] == "function_call_output"
+        end)
+
+      assert tool_output["output"] == "One matching document was found."
+    end
+
     test "skips builtin tool calls when replaying assistant context" do
       contexts = [
         %ReqLLM.Context{
@@ -330,6 +480,46 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
 
         refute Enum.any?(body["input"], &(&1["type"] == "function_call"))
       end
+    end
+
+    test "requires and encodes explicit results for provider-native calls" do
+      base_context = ReqLLM.Context.new([ReqLLM.Context.user("Search provider data")])
+
+      provider_native_call =
+        "native_1"
+        |> ReqLLM.ToolCall.new("provider_search", ~s({"query":"elixir"}))
+        |> ReqLLM.ToolCall.put_metadata(%{provider_native: :openai})
+
+      assistant =
+        ReqLLM.Context.assistant("", tool_calls: [provider_native_call])
+
+      assert {:error, %ReqLLM.Error.Validation.Error{context: error_context}} =
+               ReqLLM.Context.append_tool_exchange(base_context, assistant, [])
+
+      assert error_context[:kind] == :missing_tool_results
+
+      result =
+        ReqLLM.Context.tool_result(
+          "native_1",
+          "provider_search",
+          "provider search complete"
+        )
+
+      assert {:ok, context} =
+               ReqLLM.Context.append_tool_exchange(base_context, assistant, [result])
+
+      request = build_request(context: context)
+      body = request |> ResponsesAPI.encode_body() |> ReqLLM.Test.Helpers.json_body()
+
+      function_items =
+        Enum.filter(body["input"], &(&1["type"] in ["function_call", "function_call_output"]))
+
+      assert Enum.map(function_items, & &1["type"]) == [
+               "function_call",
+               "function_call_output"
+             ]
+
+      assert Enum.map(function_items, & &1["call_id"]) == ["native_1", "native_1"]
     end
 
     test "encodes multimodal tool results as array function_call_output" do
@@ -419,7 +609,16 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
              end)
     end
 
-    test "encodes specific tool choice with atom keys" do
+    test "encodes canonical specific tool choice with atom keys" do
+      request = build_request(tool_choice: %{type: "tool", name: "get_weather"})
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = ReqLLM.Test.Helpers.json_body(encoded)
+
+      assert body["tool_choice"] == %{"type" => "function", "name" => "get_weather"}
+    end
+
+    test "encodes OpenAI Chat-style specific tool choice with atom keys" do
       request =
         build_request(tool_choice: %{type: "function", function: %{name: "get_weather"}})
 
@@ -429,7 +628,7 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert body["tool_choice"] == %{"type" => "function", "name" => "get_weather"}
     end
 
-    test "encodes specific tool choice with string keys" do
+    test "encodes OpenAI Chat-style specific tool choice with string keys" do
       request =
         build_request(tool_choice: %{"type" => "function", "function" => %{"name" => "search"}})
 
@@ -1603,6 +1802,10 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
           "usage" => %{
             "input_tokens" => 10,
             "output_tokens" => 20,
+            "input_tokens_details" => %{
+              "cached_tokens" => 4,
+              "cache_write_tokens" => 6
+            },
             "output_tokens_details" => %{
               "reasoning_tokens" => 5
             }
@@ -1614,7 +1817,8 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert chunk.metadata.usage.input_tokens == 10
       assert chunk.metadata.usage.output_tokens == 20
       assert chunk.metadata.usage.total_tokens == 30
-      assert chunk.metadata.usage.cached_tokens == 0
+      assert chunk.metadata.usage.cached_tokens == 4
+      assert chunk.metadata.usage.cache_creation_tokens == 6
       assert chunk.metadata.usage.reasoning_tokens == 5
     end
 
@@ -2450,7 +2654,34 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
                  end)
         end)
 
-      assert log =~ "Skipping non-OpenAI reasoning detail from provider: :anthropic"
+      assert log =~ "Skipping reasoning detail from provider :anthropic for :openai request"
+    end
+
+    test "does not replay Meta reasoning details into OpenAI requests" do
+      meta_detail = %ReqLLM.Message.ReasoningDetails{
+        text: "Meta reasoning",
+        signature: "meta_encrypted_reasoning",
+        encrypted?: true,
+        provider: :meta,
+        format: "openai-responses-v1",
+        index: 0,
+        provider_data: %{"id" => "rs_meta_1", "type" => "reasoning"}
+      }
+
+      assistant_msg = %ReqLLM.Message{
+        role: :assistant,
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "Response"}],
+        reasoning_details: [meta_detail]
+      }
+
+      context = %ReqLLM.Context{messages: [assistant_msg]}
+
+      body =
+        build_request(context: context)
+        |> ResponsesAPI.encode_body()
+        |> ReqLLM.Test.Helpers.json_body()
+
+      refute Enum.any?(body["input"], &(&1["type"] == "reasoning"))
     end
 
     test "encodes summary from reasoning detail text" do

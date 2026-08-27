@@ -1,6 +1,8 @@
 defmodule ReqLLM.AuthTest do
   use ExUnit.Case, async: true
 
+  @moduletag contract: :public_api
+
   alias ReqLLM.Auth
   alias ReqLLM.OAuth
 
@@ -100,6 +102,153 @@ defmodule ReqLLM.AuthTest do
       assert refreshed["openai-codex"]["refresh"] == "fresh-refresh-token"
       assert is_integer(refreshed["openai-codex"]["expires"])
       assert refreshed["openai-codex"]["expires"] > System.system_time(:millisecond)
+    end
+
+    test "refreshes expired anthropic oauth credentials and persists them", %{tmp_dir: tmp_dir} do
+      {:ok, model} = ReqLLM.model("anthropic:claude-opus-4-8")
+      path = Path.join(tmp_dir, "oauth.json")
+
+      write_oauth_file(path, %{
+        "anthropic" => %{
+          "type" => "oauth",
+          "access" => "expired-access",
+          "refresh" => "refresh-token-123",
+          "expires" => past_expiry()
+        }
+      })
+
+      Req.Test.stub(ReqLLM.AuthAnthropicRefreshTest, fn conn ->
+        assert conn.method == "POST"
+        assert conn.request_path == "/v1/oauth/token"
+
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        params = Jason.decode!(body)
+
+        assert params["grant_type"] == "refresh_token"
+        assert params["refresh_token"] == "refresh-token-123"
+        assert params["client_id"] == "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+        Req.Test.json(conn, %{
+          "access_token" => "fresh-access-token",
+          "refresh_token" => "fresh-refresh-token",
+          "expires_in" => 3600
+        })
+      end)
+
+      assert {:ok,
+              %{
+                kind: :oauth_access_token,
+                token: "fresh-access-token",
+                source: :oauth_refresh
+              }} =
+               Auth.resolve(model,
+                 provider_options: [
+                   auth_mode: :oauth,
+                   oauth_file: path,
+                   oauth_http_options: [plug: {Req.Test, ReqLLM.AuthAnthropicRefreshTest}]
+                 ]
+               )
+
+      refreshed =
+        path
+        |> File.read!()
+        |> Jason.decode!()
+
+      assert refreshed["anthropic"]["access"] == "fresh-access-token"
+      assert refreshed["anthropic"]["refresh"] == "fresh-refresh-token"
+      assert is_integer(refreshed["anthropic"]["expires"])
+      assert refreshed["anthropic"]["expires"] > System.system_time(:millisecond)
+    end
+
+    test "serializes concurrent refreshes and atomically replaces the oauth file", %{
+      tmp_dir: tmp_dir
+    } do
+      {:ok, model} = ReqLLM.model("openai:gpt-4o")
+      path = Path.join(tmp_dir, "oauth.json")
+      parent = self()
+      refresh_requests = :atomics.new(1, [])
+      start_ref = make_ref()
+
+      write_oauth_file(path, %{
+        "openai-codex" => %{
+          "type" => "oauth",
+          "access" => "expired-access",
+          "refresh" => "shared-refresh-token",
+          "expires" => past_expiry()
+        },
+        "unrelated-provider" => %{"access" => "preserve-me"}
+      })
+
+      File.chmod!(path, 0o600)
+
+      Req.Test.stub(ReqLLM.AuthConcurrentOpenAIRefreshTest, fn conn ->
+        request_number = :atomics.add_get(refresh_requests, 1, 1)
+
+        if request_number == 1 do
+          send(parent, {:refresh_request, self()})
+
+          receive do
+            :complete_refresh -> :ok
+          after
+            5_000 -> raise "Timed out while waiting to complete the OAuth refresh"
+          end
+        end
+
+        Req.Test.json(conn, %{
+          "access_token" => "serialized-access-token",
+          "refresh_token" => "serialized-refresh-token",
+          "expires_in" => 3600
+        })
+      end)
+
+      opts = [
+        provider_options: [
+          auth_mode: :oauth,
+          oauth_file: path,
+          oauth_http_options: [plug: {Req.Test, ReqLLM.AuthConcurrentOpenAIRefreshTest}]
+        ]
+      ]
+
+      tasks =
+        1..2
+        |> Enum.map(fn _ ->
+          Task.async(fn ->
+            send(parent, {:resolver_ready, self()})
+
+            receive do
+              ^start_ref -> OAuth.resolve(model, opts)
+            after
+              5_000 -> raise "Timed out while waiting to start OAuth resolution"
+            end
+          end)
+        end)
+
+      Enum.each(tasks, fn %{pid: task_pid} ->
+        assert_receive {:resolver_ready, ^task_pid}, 5_000
+      end)
+
+      Enum.each(tasks, &send(&1.pid, start_ref))
+
+      assert_receive {:refresh_request, refresh_pid}, 5_000
+      send(refresh_pid, :complete_refresh)
+
+      results = Task.await_many(tasks, 5_000)
+
+      assert [
+               {:ok, %{token: "serialized-access-token"}},
+               {:ok, %{token: "serialized-access-token"}}
+             ] = results
+
+      assert :atomics.get(refresh_requests, 1) == 1
+
+      persisted = path |> File.read!() |> Jason.decode!()
+      {:ok, stat} = File.stat(path)
+
+      assert persisted["openai-codex"]["access"] == "serialized-access-token"
+      assert persisted["openai-codex"]["refresh"] == "serialized-refresh-token"
+      assert persisted["unrelated-provider"] == %{"access" => "preserve-me"}
+      assert Bitwise.band(stat.mode, 0o777) == 0o600
+      assert Path.wildcard(Path.join(tmp_dir, ".oauth.json.*.tmp")) == []
     end
   end
 

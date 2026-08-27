@@ -90,6 +90,29 @@ defmodule ReqLLM.OpenTelemetryTest do
     end
   end
 
+  test "publishes the stable lifecycle subset and rejects duplicate handler ids safely" do
+    handler_id = "req-llm-otel-#{System.unique_integer([:positive])}"
+
+    assert OpenTelemetry.events() == [
+             [:req_llm, :request, :start],
+             [:req_llm, :request, :stop],
+             [:req_llm, :request, :exception]
+           ]
+
+    assert :ok = OpenTelemetry.attach(handler_id, adapter: FakeAdapter, test_pid: self())
+
+    on_exit(fn ->
+      OpenTelemetry.detach(handler_id)
+    end)
+
+    assert {:error, :already_exists} =
+             OpenTelemetry.attach(handler_id, adapter: FakeAdapter, test_pid: self())
+
+    Enum.each(OpenTelemetry.events(), fn event ->
+      assert Enum.count(:telemetry.list_handlers(event), &(&1.id == handler_id)) == 1
+    end)
+  end
+
   test "attaches a GenAI client span for request lifecycle events" do
     handler_id = "req-llm-otel-#{System.unique_integer([:positive])}"
     request_id = "req-#{System.unique_integer([:positive])}"
@@ -1185,8 +1208,6 @@ defmodule ReqLLM.OpenTelemetryTest do
 
       assert_receive {:start_span, _stale_span, _name, _attrs}
 
-      Process.sleep(20)
-
       :telemetry.execute(
         [:req_llm, :request, :start],
         %{system_time: System.system_time()},
@@ -1200,9 +1221,12 @@ defmodule ReqLLM.OpenTelemetryTest do
 
       assert_receive {:start_span, _fresh_span, _name, _attrs}
 
-      assert OpenTelemetry.prune_stale_spans(handler_id, 10) >= 1
-
       table = :req_llm_open_telemetry_spans
+      now_ms = System.monotonic_time(:millisecond)
+      assert :ets.update_element(table, {handler_id, stale_id}, {3, now_ms - 120_000})
+      assert :ets.update_element(table, {handler_id, fresh_id}, {3, now_ms})
+      assert OpenTelemetry.prune_stale_spans(handler_id, 60_000) >= 1
+
       refute :ets.member(table, {handler_id, stale_id})
       assert :ets.member(table, {handler_id, fresh_id})
     end
@@ -1235,10 +1259,12 @@ defmodule ReqLLM.OpenTelemetryTest do
       assert_receive {:start_span, _, _, _}
       assert_receive {:start_span, _, _, _}
 
-      Process.sleep(20)
-      assert OpenTelemetry.prune_stale_spans(handler_a, 10) >= 1
-
       table = :req_llm_open_telemetry_spans
+      old_timestamp = System.monotonic_time(:millisecond) - 120_000
+      assert :ets.update_element(table, {handler_a, shared_id}, {3, old_timestamp})
+      assert :ets.update_element(table, {handler_b, shared_id}, {3, old_timestamp})
+      assert OpenTelemetry.prune_stale_spans(handler_a, 60_000) >= 1
+
       refute :ets.member(table, {handler_a, shared_id})
       assert :ets.member(table, {handler_b, shared_id})
     end

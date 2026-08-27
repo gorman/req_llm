@@ -37,6 +37,7 @@ defmodule ReqLLM.Streaming.RetryTest do
 
   test "retries transient transport errors before any data is received" do
     {:ok, counter} = Agent.start_link(fn -> 0 end)
+    test_pid = self()
 
     stream_fun = fn _request, _finch_name, acc, callback, _opts ->
       attempt = Agent.get_and_update(counter, fn current -> {current + 1, current + 1} end)
@@ -62,7 +63,11 @@ defmodule ReqLLM.Streaming.RetryTest do
                ReqLLM.Finch,
                [],
                callback,
-               [max_retries: 1, receive_timeout: 1_000],
+               [
+                 max_retries: 1,
+                 receive_timeout: 1_000,
+                 on_retry: fn retry -> send(test_pid, {:retry_timing, retry}) end
+               ],
                stream_fun
              )
 
@@ -74,6 +79,14 @@ defmodule ReqLLM.Streaming.RetryTest do
              {:data, "hello"},
              :done
            ]
+
+    assert_receive {:retry_timing, retry}
+    assert retry.attempt == 1
+    assert retry.next_attempt == 2
+    assert retry.max_retries == 1
+    assert retry.delay == 0
+    assert retry.duration >= 0
+    assert retry.http_status == 200
   end
 
   test "retries Finch pool readiness errors before any data is received" do
@@ -157,6 +170,77 @@ defmodule ReqLLM.Streaming.RetryTest do
     assert Agent.get(counter, & &1) == 1
   end
 
+  test "retries transient Finch transport errors before any data is received" do
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+    stream_fun = fn _request, _finch_name, acc, callback, _opts ->
+      attempt = Agent.get_and_update(counter, fn current -> {current + 1, current + 1} end)
+      acc = callback.({:status, 200}, acc)
+      acc = callback.({:headers, [{"content-type", "text/event-stream"}]}, acc)
+
+      case attempt do
+        1 ->
+          error =
+            Finch.TransportError.from_mint(%Mint.TransportError{reason: :closed})
+
+          {:error, error, acc}
+
+        2 ->
+          acc = callback.({:data, "hello"}, acc)
+          acc = callback.(:done, acc)
+          {:ok, acc}
+      end
+    end
+
+    callback = fn event, acc -> [event | acc] end
+
+    assert {:ok, events} =
+             Retry.stream(
+               Finch.build(:post, "https://example.com/stream"),
+               ReqLLM.Finch,
+               [],
+               callback,
+               [max_retries: 1, receive_timeout: 1_000],
+               stream_fun
+             )
+
+    assert Agent.get(counter, & &1) == 2
+
+    assert Enum.reverse(events) == [
+             {:status, 200},
+             {:headers, [{"content-type", "text/event-stream"}]},
+             {:data, "hello"},
+             :done
+           ]
+  end
+
+  test "does not retry non-retryable Finch transport errors" do
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+    stream_fun = fn _request, _finch_name, acc, _callback, _opts ->
+      Agent.update(counter, &(&1 + 1))
+
+      error =
+        Finch.TransportError.from_mint(%Mint.TransportError{reason: :protocol_not_negotiated})
+
+      {:error, error, acc}
+    end
+
+    callback = fn event, acc -> [event | acc] end
+
+    assert {:error, %Finch.TransportError{reason: :protocol_not_negotiated}, []} =
+             Retry.stream(
+               Finch.build(:post, "https://example.com/stream"),
+               ReqLLM.Finch,
+               [],
+               callback,
+               [max_retries: 3, receive_timeout: 1_000],
+               stream_fun
+             )
+
+    assert Agent.get(counter, & &1) == 1
+  end
+
   test "retries 429 responses before forwarding events to the callback" do
     {:ok, counter} = Agent.start_link(fn -> 0 end)
 
@@ -209,7 +293,7 @@ defmodule ReqLLM.Streaming.RetryTest do
       Agent.update(counter, &(&1 + 1))
       acc = callback.({:status, 429}, acc)
       acc = callback.({:headers, [{"retry-after", "0"}]}, acc)
-      acc = callback.({:data, ~s({"error":{"message":"Too many requests"}})}, acc)
+      acc = callback.({:data, "Too many requests"}, acc)
       acc = callback.(:done, acc)
       {:ok, acc}
     end
@@ -229,8 +313,43 @@ defmodule ReqLLM.Streaming.RetryTest do
     assert Agent.get(counter, & &1) == 2
     assert error.status == 429
     assert error.reason == "Too many requests"
+    assert error.response_body == "Too many requests"
     assert error.headers == [{"retry-after", "0"}]
+    assert error.retryable == true
     assert Enum.reverse(events) == [{:status, 429}, {:headers, [{"retry-after", "0"}]}]
+  end
+
+  test "buffers a 503 response and returns one structured API failure" do
+    stream_fun = fn _request, _finch_name, acc, callback, _opts ->
+      acc = callback.({:status, 503}, acc)
+      acc = callback.({:headers, [{"content-type", "application/json"}]}, acc)
+      acc = callback.({:data, ~s({"error":{"code":"over)}, acc)
+      acc = callback.({:data, ~s(loaded","message":"try later"}})}, acc)
+      acc = callback.(:done, acc)
+      {:ok, acc}
+    end
+
+    callback = fn event, acc -> [event | acc] end
+
+    assert {:error, %ReqLLM.Error.API.Request{} = error, events} =
+             Retry.stream(
+               Finch.build(:post, "https://example.com/stream"),
+               ReqLLM.Finch,
+               [],
+               callback,
+               [max_retries: 0, receive_timeout: 1_000],
+               stream_fun
+             )
+
+    assert error.status == 503
+    assert error.reason == "try later"
+    assert error.provider_code == "overloaded"
+    assert error.retryable == true
+
+    assert Enum.reverse(events) == [
+             {:status, 503},
+             {:headers, [{"content-type", "application/json"}]}
+           ]
   end
 
   test "retries 429 errors returned from the streaming transport" do

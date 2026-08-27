@@ -27,7 +27,7 @@ ReqLLM.generate_text(
 
 For the full model-spec workflow, see [Model Specs](model-specs.md).
 
-Azure is a strong fit for the full explicit model specification path because `base_url` is part of the model metadata. Use exact Azure model IDs from [LLMDB.xyz](https://llmdb.xyz) when possible, and use `ReqLLM.model!/1` when you need to pin `base_url` or work ahead of the registry. `deployment` remains a request option.
+Azure is a strong fit for the full explicit model specification path because `base_url` is part of the model metadata. Use exact Azure model IDs from [LLM Catalog](https://llmcatalog.dev) when possible, and use `ReqLLM.model!/1` when you need to pin `base_url` or work ahead of the registry. `deployment` remains a request option.
 
 ## Key Differences from Direct Provider APIs
 
@@ -148,6 +148,54 @@ tools = [
 )
 ```
 
+### Image Generation
+
+Available for gpt-image models (`gpt-image-1`, `gpt-image-1.5`, `gpt-image-2`) on Azure OpenAI resources. Foundry endpoints (`.services.ai.azure.com`) are not supported for images.
+
+```elixir
+{:ok, response} = ReqLLM.generate_image(
+  "azure:gpt-image-1",
+  "A watercolor painting of a lighthouse",
+  base_url: "https://my-resource.openai.azure.com/openai",
+  deployment: "my-image-deployment",
+  size: "1024x1024"
+)
+
+[image] = ReqLLM.Response.images(response)
+File.write!("lighthouse.png", image.data)
+```
+
+Image editing (multipart) with a source image and optional mask:
+
+```elixir
+{:ok, response} = ReqLLM.generate_image(
+  "azure:gpt-image-1",
+  "Make the sky stormy",
+  base_url: "https://my-resource.openai.azure.com/openai",
+  deployment: "my-image-deployment",
+  source_image: File.read!("lighthouse.png")
+)
+```
+
+Endpoint routing follows the `base_url` you supply:
+
+| `base_url` shape | Request path | Deployment sent as |
+|---|---|---|
+| `https://<resource>.openai.azure.com/openai` | `/deployments/<deployment>/images/{generations,edits}?api-version=…` | URL path segment |
+| `https://<resource>.openai.azure.com/openai/v1` | `/images/{generations,edits}` | `model` field in the body/form |
+| `https://<resource>.services.ai.azure.com` | — | not supported (returns an error) |
+
+Notes:
+
+- All three gpt-image models work on either endpoint format. A `DeploymentNotFound` (HTTP 404) means the `deployment` name does not exist on the resource, not that the model is unavailable — deployment names are set at deployment-creation time and frequently differ from the model id, so pass `deployment:` explicitly.
+- Cost is billed per token for these models. `response.usage` carries the `input_tokens`/`output_tokens` reported by the Images API alongside `image_usage`.
+- `aspect_ratio` resolves to the nearest size the model offers (`"16:9"` → `1536x1024`); an explicit `size` wins. `seed` and `negative_prompt` are rejected up front, since the Images API has no such fields.
+- Azure supports `:png` and `:jpeg` output. ReqLLM rejects `output_format: :webp` before it sends the request.
+- Non-image models are rejected before the request is sent — `azure:gpt-4o` and `azure:claude-*` both return `ReqLLM.Error.Invalid.Parameter` rather than failing at the API.
+- Image responses expose provider metadata under `response.provider_meta["azure"]`.
+
+See the [Image Generation guide](image-generation.md) for the full option list.
+
 ### Structured Output
 
 ```elixir
@@ -200,6 +248,12 @@ schema = [
 - `azure:text-embedding-3-small` - Small, efficient embeddings
 - `azure:text-embedding-3-large` - Higher quality embeddings
 - `azure:text-embedding-ada-002` - Legacy embedding model
+
+### OpenAI Image Models
+
+- `azure:gpt-image-1` - GPT Image generation and editing
+- `azure:gpt-image-1.5` - Improved GPT Image model
+- `azure:gpt-image-2` - Latest GPT Image model
 
 ### Anthropic Claude Models
 

@@ -258,13 +258,13 @@ defmodule ReqLLM.Providers.Azure.StructuredOutputTest do
       assert get_in(model.capabilities, [:tools, :enabled]) == true
     end
 
-    test "gpt-4 has tools enabled" do
-      {:ok, model} = ReqLLM.model("azure:gpt-4")
+    test "gpt-4.1 has tools enabled" do
+      {:ok, model} = ReqLLM.model("azure:gpt-4.1")
       assert get_in(model.capabilities, [:tools, :enabled]) == true
     end
 
-    test "o1-mini supports reasoning" do
-      {:ok, model} = ReqLLM.model("azure:o1-mini")
+    test "o1 supports reasoning" do
+      {:ok, model} = ReqLLM.model("azure:o1")
       assert get_in(model.capabilities, [:reasoning, :enabled]) == true
     end
 
@@ -361,7 +361,7 @@ defmodule ReqLLM.Providers.Azure.StructuredOutputTest do
     end
 
     test ":auto mode with model lacking json_schema -> tool_strict" do
-      {:ok, model} = ReqLLM.model("azure:gpt-4")
+      {:ok, model} = ReqLLM.model("azure:gpt-4.1")
 
       opts = [provider_options: [openai_structured_output_mode: :auto]]
       mode = determine_output_mode_helper(model, opts)
@@ -369,7 +369,7 @@ defmodule ReqLLM.Providers.Azure.StructuredOutputTest do
     end
 
     test "explicit :json_schema mode overrides auto detection" do
-      {:ok, model} = ReqLLM.model("azure:gpt-4")
+      {:ok, model} = ReqLLM.model("azure:gpt-4.1")
 
       opts = [provider_options: [openai_structured_output_mode: :json_schema]]
       mode = determine_output_mode_helper(model, opts)

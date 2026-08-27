@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+OTP_VERSION="29.0.3"
+ELIXIR_VERSION="1.20.2"
+OTP_SHA256="f38fb22fb9e3b53f49bebe28257d20618ce1df4d541293bceb9e04852b867b73"
+ELIXIR_SHA256="a9e88cd41fbbba7da6f6dc237a49dd2ed4e70457121035cc7fc56ad05582f394"
+OTP_DIR="/opt/erlang/OTP-${OTP_VERSION}"
+ELIXIR_DIR="/opt/elixir/${ELIXIR_VERSION}"
+
+if [[ ${EUID} -eq 0 ]]; then
+  SUDO=()
+else
+  SUDO=(sudo)
+fi
+
+download() {
+  local url=$1
+  local checksum=$2
+  local destination=$3
+
+  curl --fail --location --silent --show-error "$url" --output "$destination"
+  echo "${checksum}  ${destination}" | sha256sum --check --status
+}
+
+echo "Installing system packages..."
+"${SUDO[@]}" apt-get update -qq
+"${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+  ca-certificates \
+  curl \
+  git \
+  unzip
+
+tmp_dir=$(mktemp -d)
+trap 'rm -rf "$tmp_dir"' EXIT
+
+if [[ ! -x "${OTP_DIR}/bin/erl" ]]; then
+  echo "Installing Erlang/OTP ${OTP_VERSION}..."
+  otp_archive="${tmp_dir}/otp.tar.gz"
+  download \
+    "https://builds.hex.pm/builds/otp/ubuntu-22.04/OTP-${OTP_VERSION}.tar.gz" \
+    "$OTP_SHA256" \
+    "$otp_archive"
+  "${SUDO[@]}" mkdir -p /opt/erlang
+  "${SUDO[@]}" tar -xzf "$otp_archive" -C /opt/erlang
+  "${SUDO[@]}" "${OTP_DIR}/Install" -minimal "${OTP_DIR}"
+fi
+
+if [[ ! -x "${ELIXIR_DIR}/bin/elixir" ]]; then
+  echo "Installing Elixir ${ELIXIR_VERSION}..."
+  elixir_archive="${tmp_dir}/elixir.zip"
+  download \
+    "https://builds.hex.pm/builds/elixir/v${ELIXIR_VERSION}-otp-29.zip" \
+    "$ELIXIR_SHA256" \
+    "$elixir_archive"
+  "${SUDO[@]}" mkdir -p "$ELIXIR_DIR"
+  "${SUDO[@]}" unzip -q "$elixir_archive" -d "$ELIXIR_DIR"
+fi
+
+echo "Linking the BEAM toolchain..."
+for executable in erl erlc epmd escript run_erl to_erl dialyzer typer; do
+  if [[ -x "${OTP_DIR}/bin/${executable}" ]]; then
+    "${SUDO[@]}" ln -sfn "${OTP_DIR}/bin/${executable}" "/usr/local/bin/${executable}"
+  fi
+done
+
+for executable in elixir elixirc iex mix; do
+  "${SUDO[@]}" ln -sfn "${ELIXIR_DIR}/bin/${executable}" "/usr/local/bin/${executable}"
+done
+
+echo "Installing Hex, Rebar, and project dependencies..."
+mix local.hex --force
+mix local.rebar --force
+mix deps.get
+mix deps.compile
+
+echo "Orb setup complete."
+elixir --version

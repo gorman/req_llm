@@ -1,6 +1,8 @@
 defmodule ReqLLM.ToolTest do
   use ExUnit.Case, async: true
 
+  @moduletag contract: :public_api
+
   alias ReqLLM.Tool
 
   # Test fixtures
@@ -286,7 +288,7 @@ defmodule ReqLLM.ToolTest do
       assert Map.get(validated, :optional_field) == 42
     end
 
-    test "does not atomize unknown string keys" do
+    test "drops unknown string keys without atomizing them" do
       {:ok, tool} =
         Tool.new(
           name: "unknown_key_safety_test",
@@ -303,12 +305,60 @@ defmodule ReqLLM.ToolTest do
         String.to_existing_atom(unknown_key)
       end
 
-      assert {:error, %ReqLLM.Error.Validation.Error{}} =
+      assert {:ok, %{required_field: "abc"} = validated} =
                Tool.execute(tool, %{"required_field" => "abc", unknown_key => "value"})
+
+      refute Map.has_key?(validated, unknown_key)
 
       assert_raise ArgumentError, fn ->
         String.to_existing_atom(unknown_key)
       end
+    end
+
+    test "executes realistic tool input with extra generated keys" do
+      {:ok, tool} =
+        Tool.new(
+          name: "read_file",
+          description: "Read a file from the workspace",
+          parameter_schema: [
+            path: [type: :string, required: true]
+          ],
+          callback: fn args -> {:ok, args} end
+        )
+
+      input = %{
+        "path" => "foo/bar.ex",
+        "cwd" => "/workspace/project",
+        "reason" => "Inspect the public API facade before editing"
+      }
+
+      assert {:ok, %{path: "foo/bar.ex"} = validated} = Tool.execute(tool, input)
+      refute Map.has_key?(validated, "cwd")
+      refute Map.has_key?(validated, "reason")
+      refute Map.has_key?(validated, :cwd)
+      refute Map.has_key?(validated, :reason)
+    end
+
+    test "drops unknown atom keys" do
+      tool =
+        Tool.new!(
+          name: "read_file",
+          description: "Read a file from the workspace",
+          parameter_schema: [
+            path: [type: :string, required: true]
+          ],
+          callback: fn args -> {:ok, args} end
+        )
+
+      input = %{
+        path: "foo/bar.ex",
+        cwd: "/workspace/project",
+        reason: "Inspect the public API facade before editing"
+      }
+
+      assert {:ok, %{path: "foo/bar.ex"} = validated} = Tool.execute(tool, input)
+      refute Map.has_key?(validated, :cwd)
+      refute Map.has_key?(validated, :reason)
     end
 
     test "normalizes nested string keys in list/map schemas" do
@@ -478,6 +528,52 @@ defmodule ReqLLM.ToolTest do
                })
 
       assert validated[:pair] == {%{enabled: true}, "ok"}
+    end
+  end
+
+  describe "validate_input/2" do
+    test "returns normalized input without invoking the callback" do
+      parent = self()
+
+      tool =
+        Tool.new!(
+          name: "inspectable",
+          description: "Inspectable tool",
+          parameter_schema: [
+            query: [type: :string, required: true],
+            limit: [type: :integer, default: 10]
+          ],
+          callback: fn args ->
+            send(parent, {:tool_executed, args})
+            {:ok, args}
+          end
+        )
+
+      assert {:ok, %{query: "docs", limit: 10}} =
+               Tool.validate_input(tool, %{"query" => "docs"})
+
+      refute_received {:tool_executed, _args}
+    end
+
+    test "returns the same validation errors as execute/2" do
+      tool =
+        Tool.new!(
+          name: "validated",
+          description: "Validated tool",
+          parameter_schema: [query: [type: :string, required: true]],
+          callback: fn args -> {:ok, args} end
+        )
+
+      assert {:error, %ReqLLM.Error.Validation.Error{} = validation_error} =
+               Tool.validate_input(tool, %{})
+
+      assert {:error, %ReqLLM.Error.Validation.Error{} = execution_error} =
+               Tool.execute(tool, %{})
+
+      assert Exception.message(validation_error) == Exception.message(execution_error)
+
+      assert {:error, %ReqLLM.Error.Invalid.Parameter{}} =
+               Tool.validate_input(tool, "not a map")
     end
   end
 

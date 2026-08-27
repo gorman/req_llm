@@ -30,15 +30,23 @@ defmodule ReqLLM.StreamServer.CoreTest do
       assert :ok = StreamServer.cancel(server)
     end
 
+    test "requires a positive high watermark" do
+      assert_raise ArgumentError, ":high_watermark must be a positive integer, got: 0", fn ->
+        start_server(high_watermark: 0)
+      end
+    end
+
     test "handles HTTP task attachment and monitoring" do
       server = start_server()
       task = mock_http_task(server)
+      task_ref = Process.monitor(task.pid)
 
       Process.exit(task.pid, :kill)
 
-      :timer.sleep(10)
+      assert_receive {:DOWN, ^task_ref, :process, task_pid, :killed} when task_pid == task.pid
 
       assert Process.alive?(server)
+      assert {:error, _reason} = StreamServer.next(server, 100)
 
       StreamServer.cancel(server)
       refute Process.alive?(server)
@@ -94,6 +102,33 @@ defmodule ReqLLM.StreamServer.CoreTest do
       StreamServer.cancel(server)
     end
 
+    test "keeps failed streams alive for metadata when consumer exits" do
+      server = start_server()
+      _task = mock_http_task(server)
+
+      consumer =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      assert :ok = StreamServer.monitor_consumer(server, consumer)
+      assert :ok = StreamServer.http_event(server, {:error, :connection_lost})
+
+      consumer_ref = Process.monitor(consumer)
+      send(consumer, :stop)
+      assert_receive {:DOWN, ^consumer_ref, :process, ^consumer, :normal}
+
+      assert Process.alive?(server)
+
+      assert {:ok, metadata} = StreamServer.await_metadata(server, 100)
+      assert metadata.finish_reason == :error
+      assert metadata.error == :connection_lost
+
+      StreamServer.cancel(server)
+    end
+
     test "cancel is idempotent after StreamServer exits normally" do
       server = start_server()
       ref = Process.monitor(server)
@@ -142,11 +177,7 @@ defmodule ReqLLM.StreamServer.CoreTest do
       chunk2 = ~s(lo World"}}]}\n\n)
 
       assert :ok = GenServer.call(server, {:http_event, {:data, chunk1}})
-
-      Task.start(fn ->
-        :timer.sleep(50)
-        GenServer.call(server, {:http_event, {:data, chunk2}})
-      end)
+      assert :ok = GenServer.call(server, {:http_event, {:data, chunk2}})
 
       assert {:ok, chunk} = StreamServer.next(server, 200)
       assert chunk.type == :content
@@ -235,7 +266,7 @@ defmodule ReqLLM.StreamServer.CoreTest do
           StreamServer.next(server, 200)
         end)
 
-      :timer.sleep(50)
+      assert :ok = await_waiting_callers(server, [:next])
       sse_data = ~s(data: {"choices": [{"delta": {"content": "Delayed"}}]}\n\n)
       assert :ok = GenServer.call(server, {:http_event, {:data, sse_data}})
 

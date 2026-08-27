@@ -12,7 +12,7 @@ OPENROUTER_API_KEY=sk-or-...
 
 For the full model-spec workflow, see [Model Specs](model-specs.md).
 
-Use exact OpenRouter model IDs from [LLMDB.xyz](https://llmdb.xyz) when possible. If you need to route to a model that is not in the registry yet, use `ReqLLM.model!/1` and provide the full explicit model spec.
+Use exact OpenRouter model IDs from [LLM Catalog](https://llmcatalog.dev) when possible. If you need to route to a model that is not in the registry yet, use `ReqLLM.model!/1` and provide the full explicit model spec.
 
 ## Provider Options
 
@@ -104,7 +104,7 @@ Passed via `:provider_options` keyword:
 
 #### File parser PDFs
 
-When the `file-parser` plugin is enabled, ReqLLM encodes PDF `ContentPart.file/3` inputs in OpenRouter's expected file format:
+ReqLLM encodes PDF `ContentPart.file/3` inputs in OpenRouter's file format. The `file-parser` plugin is optional. Use it to select a PDF processing engine:
 
 ```elixir
 alias ReqLLM.Context
@@ -122,7 +122,33 @@ ReqLLM.generate_text("openrouter:anthropic/claude-sonnet-4-20250514", context,
 )
 ```
 
-Without `file-parser`, PDF parts use the normal OpenAI-compatible file encoding.
+Without `file-parser`, ReqLLM uses the same file encoding and lets OpenRouter select the PDF processing engine.
+
+### Safety Settings (Google Models)
+
+#### `openrouter_safety_settings`
+- **Type**: List of maps
+- **Purpose**: Set Google's per-category content filters on Gemini models routed through OpenRouter
+- **Example**: `provider_options: [openrouter_safety_settings: [%{category: "HARM_CATEGORY_HARASSMENT", threshold: "OFF"}]]`
+
+OpenRouter forwards the top-level `safety_settings` body field to Google, so the
+same categories and thresholds accepted by the Gemini API apply here. This works
+on both of OpenRouter's Google upstreams (`google-ai-studio` and `google-vertex`).
+
+```elixir
+safety_settings =
+  Enum.map(
+    ~w(HARM_CATEGORY_HARASSMENT HARM_CATEGORY_HATE_SPEECH
+       HARM_CATEGORY_SEXUALLY_EXPLICIT HARM_CATEGORY_DANGEROUS_CONTENT),
+    &%{category: &1, threshold: "BLOCK_ONLY_HIGH"}
+  )
+
+ReqLLM.generate_text("openrouter:google/gemini-2.5-flash", "Write a battle scene.",
+  provider_options: [openrouter_safety_settings: safety_settings]
+)
+```
+
+The option is ignored by non-Google models.
 
 ### App Attribution
 
@@ -167,6 +193,37 @@ context = ReqLLM.Context.new([
 The `cache_control` metadata is passed directly to the underlying Anthropic API, enabling prompt caching for system prompts, tools, and message content.
 
 > **Note**: This differs from the direct Anthropic provider which uses `anthropic_prompt_cache: true` option. Through OpenRouter, you have fine-grained control over exactly which content blocks get cached.
+
+## Citations (Search Models)
+
+Models that cite their sources — Perplexity Sonar in particular — return
+`url_citation` annotations. OpenRouter speaks the OpenAI Chat Completions wire
+format, so ReqLLM normalizes those citations the same way it does for OpenAI and
+exposes them through `ReqLLM.Response.annotations/1`:
+
+```elixir
+{:ok, response} = ReqLLM.generate_text(
+  "openrouter:perplexity/sonar",
+  "What is a hello world program?"
+)
+
+ReqLLM.Response.annotations(response)
+#=> [
+#=>   %{
+#=>     "type" => "url_citation",
+#=>     "url" => "https://en.wikipedia.org/wiki/Hello,_world",
+#=>     "title" => "Hello, world - Wikipedia",
+#=>     "start_index" => 0,
+#=>     "end_index" => 0
+#=>   }
+#=> ]
+```
+
+The nested `"url_citation"` wrapper OpenRouter sends on the wire is flattened, so
+the shape matches what the direct OpenAI provider returns. Streaming works the
+same way — citations accumulate across deltas and the materialized response carries
+the full list. See [Citations](openai.md#citations) in the OpenAI guide for the
+full contract, including how to consume citations live during a stream.
 
 ## Model Discovery
 

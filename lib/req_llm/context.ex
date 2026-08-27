@@ -206,6 +206,43 @@ defmodule ReqLLM.Context do
     end
   end
 
+  @doc """
+  Appends one assistant tool-call message and its matched tool results.
+
+  Accepts either the canonical assistant `ReqLLM.Message` or its
+  `ReqLLM.Response`. Tool results must be canonical tool messages built with
+  `tool_result/2`, `tool_result/3`, or `tool_result_message/4`.
+
+  The exchange is validated before the context changes. Results are matched by
+  `tool_call_id` and appended in assistant call order, regardless of input
+  order. A result without a name inherits the matched call name. Explicit
+  result names must match.
+
+  Provider-executed builtins do not require local results. Provider-native
+  calls remain explicit and require a matching result before continuation.
+  The assistant and result messages otherwise retain their content, reasoning
+  details, and metadata unchanged. This function never executes a tool or
+  starts another model call.
+
+  If the context already ends with the exact assistant message, only the
+  results are appended. This supports both the original input context and the
+  `response.context` returned by generation functions.
+
+  ## Examples
+
+      results = [
+        ReqLLM.Context.tool_result("call_1", "get_weather", "72°F and sunny")
+      ]
+
+      {:ok, continued_context} =
+        ReqLLM.Context.append_tool_exchange(input_context, response, results)
+  """
+  @spec append_tool_exchange(t(), Message.t() | ReqLLM.Response.t(), [Message.t()]) ::
+          {:ok, t()} | {:error, ReqLLM.Error.Validation.Error.t()}
+  def append_tool_exchange(%__MODULE__{} = context, source, results) do
+    ReqLLM.Context.ToolExchange.append(context, source, results)
+  end
+
   # Role helpers
 
   @doc """
@@ -1344,7 +1381,7 @@ defmodule ReqLLM.Context do
 
   defp normalize_tool_result_struct(%ToolResult{} = result) do
     content = normalize_tool_result_content(result.content, result.output)
-    metadata = ToolResult.put_output_metadata(result.metadata, result.output)
+    metadata = ToolResult.put_message_metadata(result.metadata, result)
     {content, metadata}
   end
 

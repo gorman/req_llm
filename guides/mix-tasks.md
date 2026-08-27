@@ -4,12 +4,79 @@ ReqLLM provides powerful Mix tasks for text generation and model coverage valida
 
 ## Overview
 
-ReqLLM includes two main Mix tasks:
+ReqLLM includes these main Mix tasks:
 
 | Task | Alias | Purpose |
 |------|-------|---------|
+| `mix req_llm.doctor` | — | Diagnose installation and runtime configuration without provider calls |
+| `mix req_llm.migration_audit` | — | Find precise, mechanical V2 migration work without rewriting source |
 | `mix req_llm.gen` | `mix llm` | Generate text/objects from the command line |
 | `mix req_llm.model_compat` | `mix mc` | Validate model coverage with fixtures |
+| `mix req_llm.model_support` | — | Inspect and verify evidence-derived support tiers |
+| `mix req_llm.provider_drift` | — | Run bounded, read-only live anchor verification |
+
+## mix req_llm.doctor
+
+Inspect the local ReqLLM runtime, provider registration, credential presence,
+model resolution, selected request surface, and Finch configuration. The default
+command performs no network probe or paid provider request and never prints
+credential values.
+
+```bash
+mix req_llm.doctor
+mix req_llm.doctor --provider anthropic
+mix req_llm.doctor --model openai:gpt-4o-mini --operation chat
+mix req_llm.doctor --format json
+```
+
+Warnings such as missing optional credentials exit successfully. Invalid required
+configuration, an unknown requested provider or model, an unavailable selected
+surface, or an unhealthy Finch runtime produces a non-zero exit status.
+
+### Machine-readable output
+
+Use `--format json` or `--json` for the stable schema-versioned result. Schema
+version 1 contains only redacted, JSON-safe data:
+
+```json
+{
+  "schema_version": 1,
+  "status": "ok",
+  "checks": [
+    {
+      "id": "runtime.application",
+      "layer": "runtime",
+      "status": "ok",
+      "message": "ReqLLM and its supervision tree are running.",
+      "remediation": null,
+      "details": {}
+    }
+  ]
+}
+```
+
+Top-level status is `ok`, `warning`, or `error`. Each check always includes
+`id`, `layer`, `status`, `message`, `remediation`, and `details`. New check IDs or
+detail fields may be added without changing schema version; existing common fields
+retain their meaning for schema version 1.
+
+## mix req_llm.migration_audit
+
+Scan Elixir source for active ReqLLM deprecations and precise V2-readiness
+patterns. The task parses source without evaluating or rewriting it and makes no
+provider requests.
+
+```bash
+mix req_llm.migration_audit
+mix req_llm.migration_audit lib test
+mix req_llm.migration_audit --exclude test/fixtures
+mix req_llm.migration_audit --format json
+```
+
+Actionable findings exit with status `1`; unreadable or invalid source exits
+with status `2`. Clean and advisory-only reports exit with
+status `0`. See the [V2 migration audit guide](v2-migration-audit.md) for the
+ledger schema, before/after examples, and static-analysis limitations.
 
 ## mix req_llm.gen
 
@@ -352,6 +419,86 @@ The `priv/supported_models.json` file tracks validation status:
   }
 }
 ```
+
+Scenario-level evidence is stored separately in
+`priv/model_compat_scenarios.json`. That versioned artifact records the model,
+exact execution surface inferred from the fixture request URL, scenario,
+proof level, observations, fixture names, and classified failure layer. It is
+used only by compatibility tooling and generated documentation; it never
+changes model resolution or request routing.
+
+## `mix req_llm.model_support`
+
+Inspect the conservative support tiers derived from current scenario evidence:
+
+```bash
+mix req_llm.model_support
+mix req_llm.model_support --model openai:gpt-4o-mini
+mix req_llm.model_compat --available --sample --support-tiers
+```
+
+Maintainers generate and verify the checked-in evidence reference with:
+
+```bash
+mix req_llm.model_support --generate
+mix req_llm.model_support --check
+```
+
+The generated [`model-support.md`](model-support.md) reference is deterministic
+for a given catalog and evidence snapshot. Tiers are surface-specific:
+
+- `first_class` requires current passing evidence for the entire operation baseline;
+- `best_effort` requires at least one current baseline pass but is incomplete;
+- `experimental` means evidence or current catalog declaration is missing or stale; and
+- `unsupported` includes an explicit reason such as a baseline failure layer or
+  an operation absent from current model metadata.
+
+Catalog presence alone is never evidence. These tiers do not act as a runtime
+allowlist.
+
+## `mix req_llm.provider_drift`
+
+Validate the sparse live anchor configuration without making provider calls:
+
+```bash
+mix req_llm.provider_drift --dry-run
+```
+
+Run every anchor whose credential is available, or select a provider:
+
+```bash
+mix req_llm.provider_drift
+mix req_llm.provider_drift --provider openai
+mix req_llm.provider_drift --provider anthropic,google
+```
+
+Write the sanitized JSON and Markdown reports to a chosen directory:
+
+```bash
+mix req_llm.provider_drift --output-dir .artifacts/provider-drift
+```
+
+| Option | Purpose |
+| --- | --- |
+| `--dry-run` | Validate anchors, evidence references, and guardrails without provider requests |
+| `--provider NAME[,NAME]` | Limit the run to selected configured providers |
+| `--config PATH` | Validate and run a different anchor configuration |
+| `--output-dir PATH` | Choose the report directory; defaults to `_build/provider_drift` |
+
+The default matrix is `priv/provider_drift_anchors.json`. It explicitly caps
+anchor count, concurrency, per-anchor timeout, output tokens, and estimated
+cost. Missing credentials produce skipped results rather than failures. An
+executed failure uses the same resolution, planning, encoding, transport,
+decoding, materialization, assertion, and provider-drift layers as compatibility
+evidence.
+
+The task records provider responses only into a temporary directory, derives
+the actual execution surface, and deletes the temporary files. Reports contain
+no prompts, response bodies, or credential values. They embed completed results
+in the versioned compatibility evidence schema with mode `live_probe`, but do
+not modify the checked-in evidence or influence runtime support. Use the
+separate `mix req_llm.model_compat MODEL --scenario SCENARIO --record` action
+when fixture recording is intentional.
 
 ### Example Output
 

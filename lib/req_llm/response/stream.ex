@@ -7,6 +7,7 @@ defmodule ReqLLM.Response.Stream do
   """
 
   alias ReqLLM.{Message, Response}
+  alias ReqLLM.Message.ContentPart
   alias ReqLLM.Provider.ChunkAccumulator
 
   @typedoc """
@@ -18,6 +19,7 @@ defmodule ReqLLM.Response.Stream do
   @type summary :: %{
           text: String.t(),
           thinking: String.t(),
+          content_parts: [ContentPart.t()],
           tool_calls: [map()],
           finish_reason: atom() | nil,
           usage: map() | nil
@@ -29,6 +31,7 @@ defmodule ReqLLM.Response.Stream do
   Processes all chunks and returns a map with:
   - `text` - Accumulated text content
   - `thinking` - Accumulated thinking/reasoning content
+  - `content_parts` - Complete multimodal content parts
   - `tool_calls` - List of reconstructed tool calls with merged argument fragments
   - `finish_reason` - The finish reason from metadata chunks (normalized to atom)
   - `usage` - Token usage statistics from metadata chunks
@@ -47,16 +50,24 @@ defmodule ReqLLM.Response.Stream do
   """
   @spec summarize(Enumerable.t()) :: summary()
   def summarize(chunks) do
+    {summary, _acc} = summarize_with_acc(chunks)
+    summary
+  end
+
+  defp summarize_with_acc(chunks) do
     chunks_list = if is_list(chunks), do: chunks, else: Enum.to_list(chunks)
     acc = ChunkAccumulator.reduce(ChunkAccumulator.new(), chunks_list)
 
-    %{
+    summary = %{
       text: ChunkAccumulator.finalize_text(acc),
       thinking: ChunkAccumulator.finalize_thinking(acc),
+      content_parts: ChunkAccumulator.finalize_content_parts(acc),
       tool_calls: ChunkAccumulator.finalize_tool_calls_for_response(acc),
       finish_reason: normalize_finish_reason(ChunkAccumulator.finalize_finish_reason(acc)),
       usage: ChunkAccumulator.finalize_usage(acc)
     }
+
+    {summary, acc}
   end
 
   defp normalize_finish_reason(nil), do: nil
@@ -102,14 +113,13 @@ defmodule ReqLLM.Response.Stream do
   """
   @spec join(Enumerable.t(), Response.t()) :: {:ok, Response.t()} | {:error, term()}
   def join(stream, %Response{} = response) do
-    chunks = Enum.to_list(stream)
-
-    content_text = build_content_text(chunks)
-    final_usage = merge_usage_from_chunks(chunks, response.usage)
+    {summary, acc} = summarize_with_acc(stream)
+    content_parts = joined_content_parts(summary, acc)
+    final_usage = merge_usage(response.usage, summary.usage)
 
     message = %Message{
       role: :assistant,
-      content: [%{type: :text, text: content_text}],
+      content: content_parts,
       metadata: %{}
     }
 
@@ -131,20 +141,14 @@ defmodule ReqLLM.Response.Stream do
        }}
   end
 
-  defp build_content_text(chunks) do
-    chunks
-    |> Enum.filter(&(&1.type == :content))
-    |> Enum.map_join("", & &1.text)
-  end
+  defp joined_content_parts(%{content_parts: []} = summary, _acc),
+    do: [%{type: :text, text: summary.text}]
 
-  defp merge_usage_from_chunks(chunks, existing_usage) do
-    chunks
-    |> Enum.filter(&(&1.type == :meta))
-    |> Enum.reduce(existing_usage, fn chunk, acc ->
-      usage =
-        Map.get(chunk.metadata || %{}, :usage, %{})
+  defp joined_content_parts(_summary, acc),
+    do: ChunkAccumulator.finalize_ordered_content(acc, include_thinking?: false)
 
-      ReqLLM.Usage.merge(acc || %{}, usage)
-    end)
-  end
+  defp merge_usage(existing_usage, nil), do: existing_usage
+
+  defp merge_usage(existing_usage, streamed_usage),
+    do: ReqLLM.Usage.merge(existing_usage || %{}, streamed_usage)
 end

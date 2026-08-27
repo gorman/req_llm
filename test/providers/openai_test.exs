@@ -75,14 +75,66 @@ defmodule ReqLLM.Providers.OpenAITest do
       assert request.method == :post
     end
 
-    test "prepare_request preserves custom finch from req_http_options" do
+    test "prepare_request merges custom Finch options with the request timeout" do
       {:ok, model} = ReqLLM.model("openai:gpt-4-turbo")
       context = context_fixture()
 
       {:ok, request} =
-        OpenAI.prepare_request(:chat, model, context, req_http_options: [finch: :custom_finch])
+        OpenAI.prepare_request(:chat, model, context,
+          receive_timeout: 45_000,
+          req_http_options: [finch: [name: :custom_finch, pool_tag: :bulk]]
+        )
 
-      assert request.options[:finch] == :custom_finch
+      assert request.options[:finch][:name] == :custom_finch
+      assert request.options[:finch][:pool_tag] == :bulk
+      assert request.options[:finch][:pool_timeout] == 45_000
+    end
+
+    test "prepare_request honors caller retry limits in chat and object pipelines" do
+      {:ok, chat_model} = ReqLLM.model("openai:gpt-4-turbo")
+      {:ok, object_model} = ReqLLM.model("openai:gpt-4o-mini")
+      {:ok, schema} = ReqLLM.Schema.compile(name: [type: :string, required: true])
+
+      {:ok, chat_request} =
+        OpenAI.prepare_request(:chat, chat_model, "Hello", max_retries: 0)
+
+      {:ok, object_request} =
+        OpenAI.prepare_request(:object, object_model, "Hello",
+          compiled_schema: schema,
+          max_retries: 1
+        )
+
+      {:ok, default_request} = OpenAI.prepare_request(:chat, chat_model, "Hello", [])
+
+      assert chat_request.options[:max_retries] == 0
+      assert object_request.options[:max_retries] == 1
+      assert default_request.options[:max_retries] == 3
+
+      cases = [
+        {:chat, chat_model, [], 0, 1},
+        {:object, object_model, [compiled_schema: schema], 1, 2}
+      ]
+
+      Enum.each(cases, fn {operation, model, extra_opts, max_retries, expected_attempts} ->
+        parent = self()
+
+        adapter = fn request ->
+          send(parent, {:attempt, operation})
+          {request, %Req.TransportError{reason: :closed}}
+        end
+
+        opts =
+          [max_retries: max_retries, req_http_options: [adapter: adapter]] ++ extra_opts
+
+        {:ok, request} = OpenAI.prepare_request(operation, model, "Hello", opts)
+        assert {:error, _reason} = Req.request(request)
+
+        Enum.each(1..expected_attempts, fn _attempt ->
+          assert_receive {:attempt, ^operation}
+        end)
+
+        refute_received {:attempt, ^operation}
+      end)
     end
 
     test "prepare_request routes gpt-4o models to Responses API" do
@@ -633,6 +685,38 @@ defmodule ReqLLM.Providers.OpenAITest do
 
       assert get_in(assistant_message, ["tool_calls", Access.at(0), "id"]) == "functions.add:0"
       assert tool_message["tool_call_id"] == "functions.add:0"
+    end
+
+    test "encode_body round trips matched tool exchanges in assistant call order" do
+      {:ok, model} = ReqLLM.model("openai:gpt-4o")
+      base_context = Context.new([Context.user("Get weather and time")])
+
+      assistant =
+        Context.assistant("",
+          tool_calls: [
+            {"get_weather", %{city: "Paris"}, id: "call_1"},
+            {"get_time", %{timezone: "Europe/Paris"}, id: "call_2"}
+          ],
+          metadata: %{provider_native: %{response_id: "resp_123"}}
+        )
+
+      results = [
+        Context.tool_result("call_2", "get_time", "10:00 CEST"),
+        Context.tool_result("call_1", "72°F and sunny")
+      ]
+
+      assert {:ok, context} = Context.append_tool_exchange(base_context, assistant, results)
+
+      mock_request = %Req.Request{
+        options: [context: context, model: model.model, stream: false]
+      }
+
+      decoded = mock_request |> OpenAI.encode_body() |> ReqLLM.Test.Helpers.json_body()
+      assistant_message = Enum.find(decoded["messages"], &(&1["role"] == "assistant"))
+      tool_messages = Enum.filter(decoded["messages"], &(&1["role"] == "tool"))
+
+      assert Enum.map(assistant_message["tool_calls"], & &1["id"]) == ["call_1", "call_2"]
+      assert Enum.map(tool_messages, & &1["tool_call_id"]) == ["call_1", "call_2"]
     end
 
     test "encode_body for o1 models uses max_completion_tokens" do
@@ -1306,6 +1390,18 @@ defmodule ReqLLM.Providers.OpenAITest do
       refute ReqLLM.Providers.OpenAI.AdapterHelpers.reasoning_model?("gpt-4.1-mini")
       assert ReqLLM.Providers.OpenAI.AdapterHelpers.responses_model?("gpt-4.1-mini")
     end
+
+    test "classifies search-preview models as Chat Completions only" do
+      alias ReqLLM.Providers.OpenAI.AdapterHelpers
+
+      for id <- ["gpt-4o-search-preview", "gpt-4o-mini-search-preview"] do
+        assert AdapterHelpers.search_preview_model?(id)
+        refute AdapterHelpers.responses_model?(id)
+      end
+
+      refute AdapterHelpers.search_preview_model?("gpt-4o-mini")
+      assert AdapterHelpers.responses_model?("gpt-4o-mini")
+    end
   end
 
   describe "ResponsesAPI json_schema support" do
@@ -1771,7 +1867,7 @@ defmodule ReqLLM.Providers.OpenAITest do
   end
 
   describe "ResponsesAPI tool encoding" do
-    test "passes through built-in web_search tool definitions" do
+    test "passes through built-in hosted tool definitions" do
       {:ok, model} = ReqLLM.model("openai:gpt-5-nano")
 
       context = %ReqLLM.Context{
@@ -1786,7 +1882,7 @@ defmodule ReqLLM.Providers.OpenAITest do
       opts = [
         context: context,
         model: model.model,
-        tools: [%{"type" => "web_search"}]
+        tools: [%{"type" => "web_search"}, %{"type" => "image_generation"}]
       ]
 
       request = %Req.Request{
@@ -1798,7 +1894,7 @@ defmodule ReqLLM.Providers.OpenAITest do
       encoded_request = ReqLLM.Providers.OpenAI.ResponsesAPI.encode_body(request)
       body = ReqLLM.Test.Helpers.json_body(encoded_request)
 
-      assert Enum.any?(body["tools"], fn tool -> tool["type"] == "web_search" end)
+      assert Enum.map(body["tools"], & &1["type"]) == ["web_search", "image_generation"]
     end
   end
 end

@@ -13,10 +13,10 @@ defmodule ReqLLM.ProviderTest.ComprehensiveTest do
     end
 
     test "includes Anthropic models that support structured outputs" do
-      assert Comprehensive.supports_object_generation?("anthropic:claude-opus-4-1-20250805")
+      assert Comprehensive.supports_object_generation?("anthropic:claude-sonnet-4-5-20250929")
 
       assert Comprehensive.supports_streaming_object_generation?(
-               "anthropic:claude-opus-4-1-20250805"
+               "anthropic:claude-sonnet-4-5-20250929"
              )
     end
   end

@@ -92,7 +92,8 @@ defmodule ReqLLM do
     Schema,
     Speech,
     Tool,
-    Transcription
+    Transcription,
+    Video
   }
 
   @typedoc """
@@ -107,6 +108,23 @@ defmodule ReqLLM do
           | {atom(), String.t(), keyword()}
           | {atom(), keyword()}
           | LLMDB.Model.t()
+
+  @typedoc """
+  Redacted, JSON-serializable diagnostic returned by `plan/3`.
+
+  The diagnostic contains route and option names only. It never contains provider modules,
+  model metadata, option values, credentials, prompt/message/tool/file values, or encoded bodies.
+  """
+  @type plan_diagnostic :: %{
+          model: %{provider: atom(), id: String.t()},
+          operation: :chat | :object,
+          surface: atom(),
+          transport: :req | :finch | :websocket,
+          route: %{method: :post | :websocket, path: String.t()},
+          options: %{canonical: [atom()], translated: [atom()]},
+          fallbacks: [],
+          warnings: [String.t()]
+        }
 
   @inline_model_example "%{provider: :openai, id: \"gpt-4o\"}"
   @inline_model_fields LLMDB.Model.__struct__(provider: :openai, id: "__inline__")
@@ -259,6 +277,10 @@ defmodule ReqLLM do
 
   ## Inline Models
 
+  Three-element tuple options are applied as low-precedence defaults when the tuple is
+  passed directly to an operation. Explicit operation options win. `model/1` resolves
+  only model identity, so equivalent two- and three-element tuples return the same model.
+
   For models not in the LLMDB catalog yet, use an inline model spec:
 
       model =
@@ -362,6 +384,45 @@ defmodule ReqLLM do
   end
 
   @doc """
+  Returns an experimental redacted diagnostic for a text request before execution.
+
+  `plan/3` uses the same internal planner as OpenAI Chat Completions, OpenAI Responses,
+  and Anthropic Messages execution. It resolves the selected surface and transport, but
+  does not encode a request, resolve credentials, access fixtures, or perform network I/O.
+
+  The returned map includes only the resolved provider/model ID, operation, named surface,
+  transport, relative route template, sorted option names, fallbacks, and warnings. Credential
+  and request-payload control options are omitted even from the option-name lists. ReqLLM 1.x
+  does not silently fall back to another surface, so `:fallbacks` is currently always empty.
+
+  This API is additive and experimental. Its diagnostic fields are not a stable compatibility
+  contract during ReqLLM 1.x, but existing generation and provider behavior are unaffected.
+
+  ## Examples
+
+      {:ok, diagnostic} =
+        ReqLLM.plan("openai:gpt-4o-mini", :chat,
+          max_tokens: 256,
+          stream: true
+        )
+
+      diagnostic.surface
+      #=> :openai_responses
+
+      diagnostic.transport
+      #=> :finch
+
+      diagnostic.route
+      #=> %{method: :post, path: "/responses"}
+
+  """
+  @spec plan(model_input(), :chat | :object, keyword()) ::
+          {:ok, plan_diagnostic()} | {:error, term()}
+  def plan(model_spec, operation, opts \\ []) do
+    ReqLLM.RequestPlan.Diagnostic.build(model_spec, operation, opts)
+  end
+
+  @doc """
   Returns catalog model specs for providers that are currently configured.
 
   This is intended for building model selectors or narrowing choices to providers
@@ -449,8 +510,34 @@ defmodule ReqLLM do
   defp normalize_model_metadata(%LLMDB.Model{} = model) do
     model
     |> sync_legacy_model_field()
+    |> normalize_catalog_extra()
     |> do_normalize_model_metadata()
   end
+
+  defp normalize_catalog_extra(%LLMDB.Model{extra: extra} = model) when is_map(extra) do
+    normalized_extra =
+      extra
+      |> copy_catalog_extra_key("family", :family)
+      |> copy_catalog_extra_key("wire", :wire)
+      |> normalize_catalog_wire()
+
+    %{model | extra: normalized_extra}
+  end
+
+  defp normalize_catalog_extra(%LLMDB.Model{} = model), do: model
+
+  defp copy_catalog_extra_key(extra, string_key, atom_key) do
+    case {Map.has_key?(extra, atom_key), Map.fetch(extra, string_key)} do
+      {false, {:ok, value}} -> Map.put(extra, atom_key, value)
+      _ -> extra
+    end
+  end
+
+  defp normalize_catalog_wire(%{wire: wire} = extra) when is_map(wire) do
+    Map.put(extra, :wire, copy_catalog_extra_key(wire, "protocol", :protocol))
+  end
+
+  defp normalize_catalog_wire(extra), do: extra
 
   defp do_normalize_model_metadata(%LLMDB.Model{provider: :openai} = model) do
     protocol =
@@ -659,17 +746,26 @@ defmodule ReqLLM do
   end
 
   defp warn_unverified_model(provider, model_id) do
-    IO.warn("""
-    Using unverified model: #{provider}:#{model_id}
+    if Application.get_env(:req_llm, :warn_unverified_models, true) do
+      IO.warn("""
+      Using unverified model: #{provider}:#{model_id}
 
-    This model is not in the LLMDB catalog. While it will work if the provider \
-    supports this model ID, some features like pricing, token counting, and \
-    capability detection may be unavailable.
+      This model is not in the LLMDB catalog. While it will work if the provider \
+      supports this model ID, some features like pricing, token counting, and \
+      capability detection may be unavailable.
 
-    To suppress this warning, use an inline model spec:
+      To suppress this warning, use an inline model spec:
 
-        ReqLLM.model(%{provider: :#{provider}, id: "#{model_id}"})
-    """)
+          ReqLLM.model(%{provider: :#{provider}, id: "#{model_id}"})
+
+      or, when model ids are dynamic (user- or database-configured), disable it \
+      globally:
+
+          config :req_llm, warn_unverified_models: false
+      """)
+    end
+
+    :ok
   end
 
   defp provider_atom_from_string(provider_name) when is_binary(provider_name) do
@@ -858,7 +954,16 @@ defmodule ReqLLM do
     * `:frequency_penalty` - Penalize new tokens based on frequency
     * `:tools` - List of tool definitions
     * `:tool_choice` - Tool choice strategy
+    * `:output` - A `ReqLLM.Output` descriptor for text, object, array, choice,
+      or arbitrary JSON output
+    * `:output_validation` - Final validation policy: `:compatible`, `:warn`,
+      or `:strict`; omission preserves current V1 behavior
+    * `:output_repair` - Optional one-shot local repair callback for an invalid
+      complete structured output
     * `:system_prompt` - System prompt to prepend
+    * `:receive_timeout` - Provider-transport inactivity timeout in milliseconds
+    * `:total_timeout` - Optional whole-call deadline in milliseconds, including retries
+    * `:stream_idle_timeout` - Optional semantic-progress timeout for streaming calls
     * `:provider_options` - Provider-specific options
 
   ## Examples
@@ -871,6 +976,11 @@ defmodule ReqLLM do
       ReqLLM.Response.usage(response)
       #=> %{input_tokens: 10, output_tokens: 8}
 
+      output = ReqLLM.Output.array([name: [type: :string, required: true]])
+      {:ok, response} = ReqLLM.generate_text(model, "Generate people", output: output)
+      ReqLLM.Response.output(response, output)
+      #=> [%{"name" => "Ada"}]
+
   """
   defdelegate generate_text(model_spec, messages, opts \\ []), to: Generation
 
@@ -879,7 +989,8 @@ defmodule ReqLLM do
 
   This is a convenience function that extracts just the text from the response.
   For access to usage metadata and other response data, use `generate_text/3`.
-  Raises on error.
+  Raises on error. This function remains a text-only convenience; use
+  `generate_text/3` and `ReqLLM.Response.output/2` for structured descriptors.
 
   ## Parameters
 
@@ -899,6 +1010,11 @@ defmodule ReqLLM do
   Returns a `ReqLLM.StreamResponse` that provides both real-time token streaming
   and asynchronous metadata collection (usage, finish_reason). This enables
   zero-latency content delivery while collecting billing/usage data concurrently.
+
+  Structured `:output` descriptors reuse the existing object-stream path.
+  Partial chunks are not final-schema validation results. Convert the response
+  once with `ReqLLM.StreamResponse.to_response/1`, then project the complete
+  value with `ReqLLM.Response.output/2`.
 
   The streaming implementation uses Finch directly for production-grade performance
   with automatic connection pooling and configurable checkout timeouts.
@@ -942,12 +1058,19 @@ defmodule ReqLLM do
   ## Performance Notes
 
   The stream is lazy and supports backpressure. Metadata collection happens
-  concurrently and won't block token delivery. Use cancellation for early
-  termination to free resources. High-concurrency streaming workloads can tune
+  concurrently and won't block token delivery. Use `ReqLLM.StreamResponse.close/1`
+  for early termination or after direct metadata access to free resources.
+  High-concurrency streaming workloads can tune
   Finch pool protocols with `:stream_pool_protocols`, capacity with
   `:stream_pool_size` and `:stream_pool_count`, shard selection with
   `:stream_pool_strategy`, and checkout behavior with `:stream_pool_timeout`
   config or per-request `pool_timeout: ...`.
+
+  Use `total_timeout: ...` for a whole-call deadline that includes retries and
+  `stream_idle_timeout: ...` to fail a stream that stops making semantic
+  progress. Existing `receive_timeout` behavior remains the provider-transport
+  inactivity control. See the configuration guide for precedence and terminal
+  error semantics.
 
   """
   defdelegate stream_text(model_spec, messages, opts \\ []), to: Generation
@@ -1009,6 +1132,9 @@ defmodule ReqLLM do
 
     * `:temperature` - Control randomness in responses (0.0 to 2.0)
     * `:max_tokens` - Limit the length of the response
+    * `:receive_timeout` - Provider-transport inactivity timeout in milliseconds
+    * `:total_timeout` - Optional whole-call deadline in milliseconds, including retries
+    * `:stream_idle_timeout` - Optional semantic-progress timeout for streaming calls
     * `:provider_options` - Provider-specific options
 
   ## Examples
@@ -1106,6 +1232,47 @@ defmodule ReqLLM do
       {:error, error} -> raise error
     end
   end
+
+  # ===========================================================================
+  # Video Generation API - Delegated to ReqLLM.Video
+  # ===========================================================================
+
+  @doc """
+  Submits a video generation task and returns a `ReqLLM.Video.Task` with the
+  provider `task_id`. The task runs asynchronously; poll with `query_video/3`
+  or block until completion with `wait_video/3`.
+  """
+  @spec generate_video(ReqLLM.model_input(), keyword(), keyword()) ::
+          {:ok, ReqLLM.Video.Task.t()} | {:error, term()}
+  defdelegate generate_video(model_spec, content, opts \\ []), to: Video
+
+  @doc """
+  Queries the status of a video generation task by `task_id`.
+  """
+  @spec query_video(ReqLLM.model_input(), String.t(), keyword()) ::
+          {:ok, ReqLLM.Video.Task.t()} | {:error, term()}
+  defdelegate query_video(model_spec, task_id, opts \\ []), to: Video
+
+  @doc """
+  Polls a video generation task until it reaches a terminal state.
+  """
+  @spec wait_video(ReqLLM.model_input(), String.t(), keyword()) ::
+          {:ok, ReqLLM.Video.Task.t()} | {:error, term()}
+  defdelegate wait_video(model_spec, task_id, opts \\ []), to: Video
+
+  @doc """
+  Resolves a video `file_id` to a time-limited download URL (V1 providers).
+  """
+  @spec retrieve_video_file(ReqLLM.model_input(), String.t() | integer(), keyword()) ::
+          {:ok, ReqLLM.Video.File.t()} | {:error, term()}
+  defdelegate retrieve_video_file(model_spec, file_id, opts \\ []), to: Video, as: :retrieve_file
+
+  @doc """
+  Uploads a file to the provider platform for use as video generation input.
+  """
+  @spec upload_video_file(ReqLLM.model_input(), binary(), keyword()) ::
+          {:ok, ReqLLM.Video.File.t()} | {:error, term()}
+  defdelegate upload_video_file(model_spec, file_binary, opts \\ []), to: Video, as: :upload_file
 
   @doc """
   Streams structured data generation using an AI model with schema validation.
@@ -1341,6 +1508,21 @@ defmodule ReqLLM do
   """
   defdelegate transcribe!(model_spec, audio, opts \\ []), to: Transcription
 
+  @doc """
+  Transcribes audio with sparse metadata for the same provider call.
+
+  The returned `ReqLLM.Transcription.DetailedResult` wraps the unchanged
+  `ReqLLM.Transcription.Result`. Unavailable metadata is omitted.
+  """
+  defdelegate transcribe_detailed(model_spec, audio, opts \\ []), to: Transcription
+
+  @doc """
+  Transcribes audio with call metadata, raising on error.
+
+  Same as `transcribe_detailed/3` but raises on error.
+  """
+  defdelegate transcribe_detailed!(model_spec, audio, opts \\ []), to: Transcription
+
   # ===========================================================================
   # Speech API - Delegated to ReqLLM.Speech
   # ===========================================================================
@@ -1389,11 +1571,26 @@ defmodule ReqLLM do
   defdelegate speak(model_spec, text, opts \\ []), to: Speech
 
   @doc """
+  Generates speech and returns the unchanged speech result with sparse metadata
+  for the same provider call.
+
+  See `ReqLLM.Speech.speak_detailed/3` for details.
+  """
+  defdelegate speak_detailed(model_spec, text, opts \\ []), to: Speech
+
+  @doc """
   Generates speech audio from text, raising on error.
 
   Same as `speak/3` but raises on error.
   """
   defdelegate speak!(model_spec, text, opts \\ []), to: Speech
+
+  @doc """
+  Generates speech with call metadata, raising on error.
+
+  Same as `speak_detailed/3` but raises on error.
+  """
+  defdelegate speak_detailed!(model_spec, text, opts \\ []), to: Speech
 
   # ===========================================================================
   # Vercel AI SDK Utility API - Delegated to ReqLLM.Utils

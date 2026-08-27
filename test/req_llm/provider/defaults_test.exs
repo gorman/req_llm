@@ -4,9 +4,69 @@ defmodule ReqLLM.Provider.DefaultsTest do
   alias ReqLLM.Context
   alias ReqLLM.Message
   alias ReqLLM.Message.ContentPart
+  alias ReqLLM.Message.ReasoningDetails
   alias ReqLLM.Provider.Defaults
   alias ReqLLM.Provider.Defaults.ResponseBuilder
   alias ReqLLM.StreamChunk
+
+  describe "Finch options" do
+    test "builds current Req options for the application pool and timeout" do
+      merged = Defaults.merge_finch_options([], pool_timeout: 30_000)
+
+      assert merged[:finch][:name] == ReqLLM.Application.finch_name()
+      assert merged[:finch][:pool_timeout] == 30_000
+    end
+
+    test "merges caller Finch options with request defaults" do
+      request_options = [finch: [name: MyApp.CustomFinch, pool_tag: :bulk], retry: false]
+
+      merged = Defaults.merge_finch_options(request_options, pool_timeout: 30_000)
+
+      assert merged[:finch][:name] == MyApp.CustomFinch
+      assert merged[:finch][:pool_tag] == :bulk
+      assert merged[:finch][:pool_timeout] == 30_000
+      assert merged[:retry] == false
+    end
+
+    test "lets caller Finch options override request defaults" do
+      request_options = [finch: [name: MyApp.CustomFinch, pool_timeout: 60_000]]
+
+      merged = Defaults.merge_finch_options(request_options, pool_timeout: 30_000)
+
+      assert merged[:finch][:pool_timeout] == 60_000
+    end
+
+    test "does not add a pool name to dynamic Finch pool options" do
+      request_options = [finch: [conn_max_idle_time: 10_000]]
+
+      merged = Defaults.merge_finch_options(request_options, pool_timeout: 30_000)
+
+      refute Keyword.has_key?(merged[:finch], :name)
+      assert merged[:finch][:conn_max_idle_time] == 10_000
+      assert merged[:finch][:pool_timeout] == 30_000
+    end
+
+    test "normalizes a legacy pool name" do
+      request = Req.new() |> Req.Request.merge_options(finch: MyApp.CustomFinch)
+
+      assert Defaults.finch_option(request) == [finch: [name: MyApp.CustomFinch]]
+    end
+
+    test "preserves current Finch options and merges overrides" do
+      request =
+        Req.new()
+        |> Req.Request.merge_options(finch: [name: MyApp.CustomFinch, pool_tag: :bulk])
+
+      assert Defaults.finch_option(request, pool_timeout: 30_000) ==
+               [
+                 finch: [
+                   name: MyApp.CustomFinch,
+                   pool_tag: :bulk,
+                   pool_timeout: 30_000
+                 ]
+               ]
+    end
+  end
 
   describe "encode_context_to_openai_format/2" do
     test "encodes text content correctly" do
@@ -107,6 +167,31 @@ defmodule ReqLLM.Provider.DefaultsTest do
              ]
     end
 
+    test "preserves explicit prompt cache breakpoints on supported content blocks" do
+      breakpoint = %{mode: "explicit"}
+
+      message = %Message{
+        role: :user,
+        content: [
+          ContentPart.text("Stable text", %{prompt_cache_breakpoint: breakpoint}),
+          ContentPart.image_url("https://example.com/image.png", %{
+            "prompt_cache_breakpoint" => breakpoint
+          }),
+          ContentPart.file_id("file_123", %{prompt_cache_breakpoint: breakpoint})
+        ]
+      }
+
+      context = %Context{messages: [message]}
+      result = Defaults.encode_context_to_openai_format(context, "gpt-5.6")
+
+      [encoded_message] = result.messages
+
+      assert [text_block, image_block, file_block] = encoded_message.content
+      assert text_block.prompt_cache_breakpoint == breakpoint
+      assert image_block.prompt_cache_breakpoint == breakpoint
+      assert file_block.prompt_cache_breakpoint == breakpoint
+    end
+
     test "ignores non-passthrough metadata keys" do
       content_with_extra_meta = %ContentPart{
         type: :text,
@@ -189,6 +274,50 @@ defmodule ReqLLM.Provider.DefaultsTest do
              }
     end
 
+    test "encodes assistant tool call structs to OpenAI wire maps" do
+      tool_call = ReqLLM.ToolCall.new("call_weather", "weather", ~s({"city":"Paris"}))
+      message = %Message{role: :assistant, content: [], tool_calls: [tool_call]}
+      context = %Context{messages: [message]}
+
+      result = Defaults.encode_context_to_openai_format(context, "gpt-4")
+      [encoded_message] = result.messages
+
+      assert encoded_message.tool_calls == [
+               %{
+                 id: "call_weather",
+                 type: "function",
+                 function: %{name: "weather", arguments: ~s({"city":"Paris"})}
+               }
+             ]
+    end
+
+    test "preserves OpenAI image detail inside image_url payload" do
+      image = ContentPart.image_url("https://example.com/image.png", %{"detail" => "high"})
+      message = %Message{role: :user, content: [image]}
+      context = %Context{messages: [message]}
+
+      result = Defaults.encode_context_to_openai_format(context, "gpt-4")
+      [encoded_message] = result.messages
+      [image_block] = encoded_message.content
+
+      assert image_block == %{
+               type: "image_url",
+               image_url: %{url: "https://example.com/image.png", detail: "high"}
+             }
+    end
+
+    test "encodes file id content parts to OpenAI file blocks" do
+      file = ContentPart.file_id("file_123")
+      message = %Message{role: :user, content: [file]}
+      context = %Context{messages: [message]}
+
+      result = Defaults.encode_context_to_openai_format(context, "gpt-4")
+      [encoded_message] = result.messages
+      [file_block] = encoded_message.content
+
+      assert file_block == %{type: "file", file: %{file_id: "file_123"}}
+    end
+
     test "raises for unsupported video_url content parts" do
       video_url_part = ContentPart.video_url("https://example.com/clip.mp4")
 
@@ -259,9 +388,17 @@ defmodule ReqLLM.Provider.DefaultsTest do
              ) == expected_message_result
     end
 
-    test "encodes reasoning_details for round-trip preservation" do
+    test "encodes normalized reasoning_details for round-trip preservation" do
       reasoning_details = [
-        %{"type" => "encrypted_thought", "data" => "abc123", "format" => "google-gemini-v1"}
+        %ReasoningDetails{
+          text: "hidden thought",
+          signature: "sig-123",
+          encrypted?: true,
+          provider: :openrouter,
+          format: "google-gemini-v1",
+          index: 0,
+          provider_data: %{"type" => "encrypted_thought", "data" => "abc123"}
+        }
       ]
 
       message = %Message{
@@ -271,11 +408,26 @@ defmodule ReqLLM.Provider.DefaultsTest do
       }
 
       context = %Context{messages: [message]}
-      result = Defaults.encode_context_to_openai_format(context, "gemini-2.5-flash")
+
+      result =
+        Defaults.encode_context_to_openai_format(context, "gemini-2.5-flash",
+          encode_reasoning_details?: true
+        )
 
       [encoded_message] = result.messages
 
-      assert encoded_message.reasoning_details == reasoning_details
+      assert encoded_message.reasoning_details == [
+               %{
+                 "type" => "encrypted_thought",
+                 "data" => "abc123",
+                 "text" => "hidden thought",
+                 "signature" => "sig-123",
+                 "signature_encrypted" => true,
+                 "format" => "google-gemini-v1",
+                 "index" => 0
+               }
+             ]
+
       assert encoded_message.role == "assistant"
       assert encoded_message.content == "I'll help with that."
     end
@@ -485,6 +637,69 @@ defmodule ReqLLM.Provider.DefaultsTest do
       end
     end
 
+    test "decodes prompt cache write usage", %{model: model} do
+      response_data = %{
+        "choices" => [%{"message" => %{"content" => "Cached"}, "finish_reason" => "stop"}],
+        "usage" => %{
+          "prompt_tokens" => 2_000,
+          "completion_tokens" => 10,
+          "total_tokens" => 2_010,
+          "prompt_tokens_details" => %{
+            "cached_tokens" => 1_200,
+            "cache_write_tokens" => 800
+          }
+        }
+      }
+
+      assert {:ok, response} = Defaults.decode_response_body_openai_format(response_data, model)
+      assert response.usage.cached_tokens == 1_200
+      assert response.usage.cache_creation_tokens == 800
+    end
+
+    test "decodes reasoning_details to normalized structs", %{model: model} do
+      response_data = %{
+        "id" => "chatcmpl-reasoning",
+        "model" => "openai/gpt-5-mini-2025-08-07",
+        "choices" => [
+          %{
+            "message" => %{
+              "role" => "assistant",
+              "content" => nil,
+              "reasoning" => "I should answer briefly.",
+              "reasoning_details" => [
+                %{
+                  "type" => "reasoning.text",
+                  "format" => "openrouter-v1",
+                  "index" => 0,
+                  "text" => "I should answer briefly.",
+                  "signature" => "sig-abc",
+                  "signature_encrypted" => true,
+                  "provider_extra" => %{"kept" => true}
+                }
+              ]
+            },
+            "finish_reason" => "length"
+          }
+        ]
+      }
+
+      {:ok, result} = Defaults.decode_response_body_openai_format(response_data, model)
+
+      assert ReqLLM.Response.thinking(result) == "I should answer briefly."
+      assert [%ReasoningDetails{} = detail] = result.message.reasoning_details
+      assert detail.text == "I should answer briefly."
+      assert detail.signature == "sig-abc"
+      assert detail.encrypted? == true
+      assert detail.provider == :openai
+      assert detail.format == "openrouter-v1"
+      assert detail.index == 0
+
+      assert detail.provider_data == %{
+               "type" => "reasoning.text",
+               "provider_extra" => %{"kept" => true}
+             }
+    end
+
     test "decodes tool calls without type field (Mistral format)", %{model: model} do
       # Mistral API omits the "type" field in tool_calls, unlike OpenAI
       response_data = %{
@@ -547,6 +762,44 @@ defmodule ReqLLM.Provider.DefaultsTest do
 
       assert ReqLLM.Response.thinking(result) == "Okay, let me plan this."
       assert ReqLLM.Response.text(result) == "Build a broad foundation first."
+    end
+
+    test "decodes generated images from OpenRouter responses" do
+      model = %LLMDB.Model{provider: :openrouter, id: "google/gemini-3-pro-image"}
+      image_data = <<255, 216, 255, 224>>
+      data_uri = "data:image/jpeg;base64,#{Base.encode64(image_data)}"
+      invalid_data_uri = "data:image/png;base64,not-valid-base64!"
+
+      response_data = %{
+        "choices" => [
+          %{
+            "message" => %{
+              "role" => "assistant",
+              "content" => "",
+              "images" => [
+                %{"type" => "image_url", "image_url" => %{"url" => data_uri}},
+                %{
+                  "type" => "image_url",
+                  "image_url" => %{
+                    "url" => "https://example.com/generated.png",
+                    "detail" => "high"
+                  }
+                },
+                %{"type" => "image_url", "image_url" => %{"url" => invalid_data_uri}}
+              ]
+            },
+            "finish_reason" => "stop"
+          }
+        ]
+      }
+
+      {:ok, result} = Defaults.decode_response_body_openai_format(response_data, model)
+
+      assert ReqLLM.Response.images(result) == [
+               ContentPart.image(image_data, "image/jpeg"),
+               ContentPart.image_url("https://example.com/generated.png", %{"detail" => "high"}),
+               ContentPart.image_url(invalid_data_uri)
+             ]
     end
   end
 
@@ -715,6 +968,108 @@ defmodule ReqLLM.Provider.DefaultsTest do
              ] = chunks
     end
 
+    test "retains generated images from OpenRouter streaming deltas" do
+      model = %LLMDB.Model{provider: :openrouter, id: "google/gemini-3-pro-image"}
+      image_data = <<255, 216, 255, 224>>
+      data_uri = "data:image/jpeg;base64,#{Base.encode64(image_data)}"
+
+      event = %{
+        data: %{
+          "choices" => [
+            %{
+              "index" => 0,
+              "finish_reason" => nil,
+              "delta" => %{
+                "role" => "assistant",
+                "content" => "",
+                "images" => [
+                  %{"type" => "image_url", "image_url" => %{"url" => data_uri}}
+                ]
+              }
+            }
+          ]
+        }
+      }
+
+      chunks = Defaults.default_decode_stream_event(event, model)
+
+      assert [
+               %{
+                 type: :content_part,
+                 content_part: %ContentPart{
+                   type: :image,
+                   data: ^image_data,
+                   media_type: "image/jpeg"
+                 }
+               }
+             ] = chunks
+
+      {:ok, response} =
+        ResponseBuilder.build_response(chunks, %{},
+          context: Context.new([]),
+          model: model
+        )
+
+      assert ReqLLM.Response.images(response) == [
+               ContentPart.image(image_data, "image/jpeg")
+             ]
+    end
+
+    test "emits text and images from the same streaming delta" do
+      model = %LLMDB.Model{provider: :openrouter, id: "google/gemini-3-pro-image"}
+      image_url = "https://example.com/generated.png"
+
+      event = %{
+        data: %{
+          "choices" => [
+            %{
+              "delta" => %{
+                "content" => "Generated image:",
+                "images" => [
+                  %{"type" => "image_url", "image_url" => %{"url" => image_url}}
+                ]
+              }
+            }
+          ]
+        }
+      }
+
+      assert [
+               %StreamChunk{type: :content, text: "Generated image:"},
+               %StreamChunk{
+                 type: :content_part,
+                 content_part: %ContentPart{type: :image_url, url: ^image_url}
+               }
+             ] = Defaults.default_decode_stream_event(event, model)
+    end
+
+    test "preserves image and text order in streaming responses" do
+      model = %LLMDB.Model{provider: :openrouter, id: "google/gemini-3-pro-image"}
+      first_image = ContentPart.image(<<1>>, "image/png")
+      second_image = ContentPart.image(<<2>>, "image/png")
+
+      chunks = [
+        StreamChunk.content_part(first_image),
+        StreamChunk.text("First caption"),
+        StreamChunk.content_part(second_image),
+        StreamChunk.text("Second "),
+        StreamChunk.text("caption")
+      ]
+
+      {:ok, response} =
+        ResponseBuilder.build_response(chunks, %{},
+          context: Context.new([]),
+          model: model
+        )
+
+      assert response.message.content == [
+               first_image,
+               ContentPart.text("First caption"),
+               second_image,
+               ContentPart.text("Second caption")
+             ]
+    end
+
     test "handles nil tool names in streaming deltas", %{model: model} do
       nil_name_event = %{
         data: %{
@@ -760,7 +1115,9 @@ defmodule ReqLLM.Provider.DefaultsTest do
       chunks = Defaults.default_decode_stream_event(event, model)
 
       assert [%StreamChunk{type: :meta, metadata: meta}] = chunks
-      assert meta.reasoning_details == reasoning_details
+      assert [%ReasoningDetails{}, %ReasoningDetails{}] = meta.reasoning_details
+      assert Enum.map(meta.reasoning_details, & &1.provider_data) == reasoning_details
+      assert Enum.map(meta.reasoning_details, & &1.provider) == [:openai, :openai]
     end
 
     test "emits reasoning_details alongside content chunks", %{model: model} do
@@ -787,7 +1144,10 @@ defmodule ReqLLM.Provider.DefaultsTest do
       assert content_chunk.text == "Hello world"
 
       meta_chunk = Enum.find(chunks, &(&1.type == :meta))
-      assert meta_chunk.metadata.reasoning_details == reasoning_details
+      assert [%ReasoningDetails{} = detail] = meta_chunk.metadata.reasoning_details
+      assert detail.provider_data == %{"type" => "thought"}
+      assert detail.signature == "xyz789"
+      assert detail.provider == :openai
     end
 
     test "does not emit reasoning_details meta when list is empty", %{model: model} do
@@ -848,7 +1208,9 @@ defmodule ReqLLM.Provider.DefaultsTest do
       assert length(chunks) == 2
 
       reasoning_chunk = Enum.find(chunks, &Map.has_key?(&1.metadata, :reasoning_details))
-      assert reasoning_chunk.metadata.reasoning_details == reasoning_details
+      assert [%ReasoningDetails{} = detail] = reasoning_chunk.metadata.reasoning_details
+      assert detail.provider_data == %{"type" => "thought", "data" => "final"}
+      assert detail.provider == :openai
 
       finish_chunk = Enum.find(chunks, &Map.has_key?(&1.metadata, :finish_reason))
       assert finish_chunk.metadata.finish_reason == :stop
@@ -950,8 +1312,14 @@ defmodule ReqLLM.Provider.DefaultsTest do
 
     test "accumulates reasoning_details from meta chunks", %{model: model, context: context} do
       reasoning_details = [
-        %{"type" => "encrypted_thought", "data" => "abc123"},
-        %{"type" => "encrypted_thought", "data" => "def456"}
+        %ReasoningDetails{
+          provider: :openai,
+          provider_data: %{"type" => "encrypted_thought", "data" => "abc123"}
+        },
+        %ReasoningDetails{
+          provider: :openai,
+          provider_data: %{"type" => "encrypted_thought", "data" => "def456"}
+        }
       ]
 
       chunks = [
@@ -969,8 +1337,19 @@ defmodule ReqLLM.Provider.DefaultsTest do
       model: model,
       context: context
     } do
-      details1 = [%{"type" => "thought", "data" => "first"}]
-      details2 = [%{"type" => "thought", "data" => "second"}]
+      details1 = [
+        %ReasoningDetails{
+          provider: :openai,
+          provider_data: %{"type" => "thought", "data" => "first"}
+        }
+      ]
+
+      details2 = [
+        %ReasoningDetails{
+          provider: :openai,
+          provider_data: %{"type" => "thought", "data" => "second"}
+        }
+      ]
 
       chunks = [
         StreamChunk.text("Hello"),
@@ -1012,7 +1391,13 @@ defmodule ReqLLM.Provider.DefaultsTest do
     end
 
     test "preserves reasoning_details alongside tool calls", %{model: model, context: context} do
-      reasoning_details = [%{"type" => "thought", "signature" => "xyz"}]
+      reasoning_details = [
+        %ReasoningDetails{
+          provider: :openai,
+          signature: "xyz",
+          provider_data: %{"type" => "thought"}
+        }
+      ]
 
       chunks = [
         StreamChunk.tool_call("get_weather", %{"city" => "NYC"}, %{id: "call_123"}),

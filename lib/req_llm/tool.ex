@@ -56,6 +56,7 @@ defmodule ReqLLM.Tool do
 
     * `new/1` - Creates a new Tool from the given options
     * `new!/1` - Creates a new Tool from the given options, raising on error
+    * `validate_input/2` - Validates input without invoking the callback
     * `execute/2` - Executes a tool with the given input parameters
     * `to_schema/2` - Converts a Tool to provider-specific schema format
     * `to_json_schema/1` - Converts a Tool to JSON Schema format for LLM integration
@@ -276,14 +277,58 @@ defmodule ReqLLM.Tool do
       #=> {:error, %ReqLLM.Error.Validation.Error{...}}
 
   """
-  @spec execute(t(), map()) :: {:ok, term()} | {:error, term()}
-  def execute(%__MODULE__{} = tool, input) when is_map(input) do
+  @spec execute(t(), term()) :: {:ok, term()} | {:error, term()}
+  def execute(%__MODULE__{} = tool, input) do
     with {:ok, validated_input} <- validate_input(tool, input) do
       call_callback(tool.callback, validated_input)
     end
   end
 
-  def execute(%__MODULE__{}, input) do
+  @doc """
+  Validates input parameters without invoking the tool callback.
+
+  This uses the same schema validation and key normalization as `execute/2`.
+  It is useful when inspecting a model-produced tool call before deciding
+  whether to execute it.
+
+  Returns the normalized, validated input on success. Invalid input returns the
+  same error shape as `execute/2` and never invokes the callback.
+  """
+  @spec validate_input(t(), term()) :: {:ok, map()} | {:error, term()}
+  def validate_input(%__MODULE__{compiled: nil}, input) when is_map(input), do: {:ok, input}
+
+  def validate_input(
+        %__MODULE__{compiled: schema, parameter_schema: parameter_schema},
+        input
+      )
+      when is_map(input) do
+    normalized_input = normalize_input_keys(input, parameter_schema)
+
+    try do
+      case NimbleOptions.validate(normalized_input, schema) do
+        {:ok, validated_input} ->
+          {:ok, validated_input}
+
+        {:error, error} ->
+          {:error,
+           ReqLLM.Error.Validation.Error.exception(
+             tag: :parameter_validation,
+             reason: Exception.message(error),
+             context: [input: input]
+           )}
+      end
+    rescue
+      error ->
+        {:error,
+         ReqLLM.Error.Validation.Error.exception(
+           tag: :parameter_validation,
+           reason: Exception.message(error),
+           context: [input: input]
+         )}
+    end
+  end
+
+  def validate_input(%__MODULE__{}, input) do
     {:error,
      ReqLLM.Error.Invalid.Parameter.exception(
        parameter: "Input must be a map, got: #{inspect(input)}"
@@ -465,35 +510,6 @@ defmodule ReqLLM.Tool do
     end
   end
 
-  defp validate_input(%__MODULE__{compiled: nil}, input), do: {:ok, input}
-
-  defp validate_input(%__MODULE__{compiled: schema, parameter_schema: parameter_schema}, input) do
-    normalized_input = normalize_input_keys(input, parameter_schema)
-
-    try do
-      case NimbleOptions.validate(normalized_input, schema) do
-        {:ok, validated_input} ->
-          {:ok, validated_input}
-
-        {:error, error} ->
-          {:error,
-           ReqLLM.Error.Validation.Error.exception(
-             tag: :parameter_validation,
-             reason: Exception.message(error),
-             context: [input: input]
-           )}
-      end
-    rescue
-      error ->
-        {:error,
-         ReqLLM.Error.Validation.Error.exception(
-           tag: :parameter_validation,
-           reason: Exception.message(error),
-           context: [input: input]
-         )}
-    end
-  end
-
   defp normalize_input_keys(input, parameter_schema)
        when is_map(input) and is_list(parameter_schema) do
     schema_entries =
@@ -509,12 +525,21 @@ defmodule ReqLLM.Tool do
       |> Map.keys()
       |> Map.new(fn key -> {Atom.to_string(key), key} end)
 
-    Map.new(input, fn {key, value} ->
-      {normalized_key, field_opts} =
-        normalize_key_and_field_opts(key, schema_key_map, schema_entries)
+    input
+    |> Enum.flat_map(fn {key, value} ->
+      case normalize_key_and_field_opts(key, schema_key_map, schema_entries) do
+        {normalized_key, field_opts} when is_atom(normalized_key) ->
+          if Map.has_key?(schema_entries, normalized_key) do
+            [{normalized_key, normalize_typed_value(value, field_opts)}]
+          else
+            []
+          end
 
-      {normalized_key, normalize_typed_value(value, field_opts)}
+        _ ->
+          []
+      end
     end)
+    |> Map.new()
   end
 
   defp normalize_input_keys(input, _parameter_schema), do: input

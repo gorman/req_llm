@@ -100,6 +100,21 @@ defmodule ReqLLM.TelemetryTest do
     assert google_reasoning.effective_budget_tokens == 8192
   end
 
+  test "preserves max as a canonical reasoning effort" do
+    reasoning =
+      reasoning_model(:openai, "gpt-5.6-sol")
+      |> ReqLLM.Telemetry.new_context(
+        [context: ReqLLM.Context.new([user("hello")]), reasoning_effort: :max],
+        operation: :chat
+      )
+      |> ReqLLM.Telemetry.start_request(%{"reasoning" => %{"effort" => "max"}})
+      |> ReqLLM.Telemetry.reasoning_metadata()
+      |> Map.fetch!(:reasoning)
+
+    assert reasoning.requested_effort == :max
+    assert reasoning.effective_effort == :max
+  end
+
   test "explicit disable signals win over enabled reasoning hints" do
     anthropic_reasoning =
       reasoning_model(:anthropic, "claude-sonnet-4-5")
@@ -251,7 +266,7 @@ defmodule ReqLLM.TelemetryTest do
 
     assert_receive {:telemetry_event, [:req_llm, :request, :start], _, start_meta}
     assert_receive {:telemetry_event, [:req_llm, :request, :stop], _, stop_meta}
-    refute_receive {:telemetry_event, [:req_llm, :reasoning, _], _, _}
+    refute_received {:telemetry_event, [:req_llm, :reasoning, _], _, _}
     refute start_meta.reasoning[:supported?]
     refute stop_meta.reasoning[:effective?]
     assert stop_meta.reasoning.channel == :none

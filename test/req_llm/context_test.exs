@@ -1,6 +1,8 @@
 defmodule ReqLLM.ContextTest do
   use ExUnit.Case, async: true
 
+  @moduletag contract: :public_api
+
   alias ReqLLM.Context
   alias ReqLLM.Message
   alias ReqLLM.Message.ContentPart
@@ -1097,6 +1099,7 @@ defmodule ReqLLM.ContextTest do
 
       assert msg.metadata[:request_id] == "req_explicit"
       assert msg.metadata[:tool_output] == %{ok: true, result: %{sum: 3}}
+      assert ReqLLM.ToolResult.explicit_content?(msg)
     end
 
     test "normalizes full tool conversation flow" do

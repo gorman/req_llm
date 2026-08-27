@@ -29,12 +29,14 @@ defmodule ReqLLM.Images do
                  ],
                  aspect_ratio: [
                    type: :string,
-                   doc: ~s(Requested aspect ratio, e.g. "1:1" or "16:9")
+                   doc:
+                     ~s(Requested aspect ratio, e.g. "1:1" or "16:9"; OpenAI and Azure resolve it to the nearest size they offer - warning when the model family cannot match the orientation - and an explicit :size wins)
                  ],
                  output_format: [
                    type: {:in, @output_formats},
                    default: :png,
-                   doc: "Requested output image encoding"
+                   doc:
+                     "Requested output image encoding (provider dependent; Azure supports :png and :jpeg)"
                  ],
                  response_format: [
                    type: {:in, @response_formats},
@@ -43,39 +45,43 @@ defmodule ReqLLM.Images do
                  ],
                  seed: [
                    type: :integer,
-                   doc: "Random seed for deterministic image generation (provider dependent)"
+                   doc:
+                     "Random seed for deterministic image generation (provider dependent; dropped with a warning by OpenAI and Azure image models, subject to :on_unsupported)"
                  ],
                  quality: [
                    type: {:or, [{:in, [:standard, :hd]}, :string]},
-                   doc: "Requested quality (provider dependent)"
+                   doc:
+                     "Requested quality (provider dependent; gpt-image models take low/medium/high, so :standard/:hd are translated with a warning)"
                  ],
                  style: [
                    type: {:or, [{:in, [:vivid, :natural]}, :string]},
-                   doc: "Requested style (provider dependent)"
+                   doc:
+                     "Requested style (provider dependent; only DALL-E 3 accepts it, other OpenAI/Azure image models drop it with a warning)"
                  ],
                  negative_prompt: [
                    type: :string,
-                   doc: "Negative prompt text (provider dependent)"
+                   doc:
+                     "Negative prompt text (provider dependent; dropped with a warning by OpenAI and Azure image models, which have no such field, subject to :on_unsupported)"
                  ],
                  source_image: [
                    type: {:custom, __MODULE__, :validate_binary, []},
                    doc:
-                     "Source image bytes for image editing or reference generation (OpenAI image models only)"
+                     "Source image bytes for image editing or reference generation (OpenAI and Azure image models only)"
                  ],
                  source_image_media_type: [
                    type: :string,
                    doc:
-                     "MIME type for source_image, defaults to image/png when source_image is set (OpenAI image models only)"
+                     "MIME type for source_image, defaults to image/png when source_image is set (OpenAI and Azure image models only)"
                  ],
                  mask: [
                    type: {:custom, __MODULE__, :validate_binary, []},
                    doc:
-                     "Optional mask image bytes for inpainting/editing (OpenAI image models only)"
+                     "Optional mask image bytes for inpainting/editing (OpenAI and Azure image models only)"
                  ],
                  mask_media_type: [
                    type: :string,
                    doc:
-                     "MIME type for mask, defaults to image/png when mask is set (OpenAI image models only)"
+                     "MIME type for mask, defaults to image/png when mask is set (OpenAI and Azure image models only)"
                  ],
                  user: [
                    type: :string,
@@ -99,6 +105,10 @@ defmodule ReqLLM.Images do
                  receive_timeout: [
                    type: :pos_integer,
                    doc: "Timeout for receiving HTTP responses in milliseconds"
+                 ],
+                 total_timeout: [
+                   type: {:or, [:pos_integer, {:in, [:infinity]}]},
+                   doc: "Optional total model-call timeout in milliseconds, including retries"
                  ],
                  max_retries: [
                    type: :non_neg_integer,
@@ -138,12 +148,22 @@ defmodule ReqLLM.Images do
           keyword()
         ) :: {:ok, Response.t()} | {:error, term()}
   def generate_image(model_spec, prompt_or_messages, opts \\ []) do
+    opts = ReqLLM.ModelInput.merge_tuple_defaults(model_spec, :image, opts)
+    deadline = ReqLLM.TimeoutBudget.deadline(opts)
+
     with {:ok, model} <- ReqLLM.model(model_spec),
          {:ok, provider_module} <- ReqLLM.provider(model.provider),
+         {:ok, opts} <-
+           ReqLLM.Provider.Options.normalize_namespaced_provider_options(
+             provider_module,
+             :image,
+             model,
+             opts
+           ),
          {:ok, request} <-
            provider_module.prepare_request(:image, model, prompt_or_messages, opts),
          {:ok, %Req.Response{status: status, body: response}} when status in 200..299 <-
-           Req.request(request) do
+           ReqLLM.TimeoutBudget.request(request, deadline) do
       {:ok, response}
     else
       {:ok, %Req.Response{status: status, body: body}} ->

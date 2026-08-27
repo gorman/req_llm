@@ -23,9 +23,10 @@ defmodule ReqLLM.StreamServer.ErrorHandlingTest do
     test "handles HTTP task crash gracefully" do
       server = start_server()
       task = mock_http_task(server)
+      task_ref = Process.monitor(task.pid)
 
       Process.exit(task.pid, :kill)
-      :timer.sleep(20)
+      assert_receive {:DOWN, ^task_ref, :process, task_pid, :killed} when task_pid == task.pid
 
       assert Process.alive?(server)
 
@@ -37,13 +38,13 @@ defmodule ReqLLM.StreamServer.ErrorHandlingTest do
     test "cancellation kills HTTP task and cleans up" do
       server = start_server()
       task = mock_http_task(server)
+      task_ref = Process.monitor(task.pid)
 
       assert Process.alive?(task.pid)
 
       assert :ok = StreamServer.cancel(server)
 
-      :timer.sleep(20)
-
+      assert_receive {:DOWN, ^task_ref, :process, task_pid, _reason} when task_pid == task.pid
       refute Process.alive?(task.pid)
     end
 
@@ -54,12 +55,11 @@ defmodule ReqLLM.StreamServer.ErrorHandlingTest do
       malformed_data = "invalid sse data without proper format\n\n"
       assert :ok = GenServer.call(server, {:http_event, {:data, malformed_data}})
 
-      Task.start(fn ->
-        :timer.sleep(100)
-        GenServer.call(server, {:http_event, :done})
-      end)
+      next_task = Task.async(fn -> StreamServer.next(server, 200) end)
+      assert :ok = await_waiting_callers(server, [:next])
+      assert :ok = GenServer.call(server, {:http_event, :done})
 
-      assert :halt = StreamServer.next(server, 200)
+      assert :halt = Task.await(next_task)
 
       StreamServer.cancel(server)
     end
@@ -103,6 +103,41 @@ defmodule ReqLLM.StreamServer.ErrorHandlingTest do
       assert {:error, %ReqLLM.Error.API.Request{} = error} = StreamServer.next(server, 100)
       assert error.status == 500
       assert error.reason == "Internal server error"
+      assert error.retryable == true
+
+      StreamServer.cancel(server)
+    end
+
+    test "preserves an HTTP error after the response completes" do
+      server = start_server()
+      _task = mock_http_task(server)
+
+      assert :ok = GenServer.call(server, {:http_event, {:status, 500}})
+
+      error_json = Jason.encode!(%{"error" => %{"message" => "Internal server error"}})
+      assert :ok = GenServer.call(server, {:http_event, {:data, error_json}})
+      assert :ok = GenServer.call(server, {:http_event, :done})
+
+      assert {:error, %ReqLLM.Error.API.Request{} = error} = StreamServer.next(server, 100)
+      assert error.status == 500
+      assert error.reason == "Internal server error"
+      assert error.response_body["message"] == "Internal server error"
+
+      StreamServer.cancel(server)
+    end
+
+    test "returns an HTTP error when a failed response has no body" do
+      server = start_server()
+      _task = mock_http_task(server)
+
+      assert :ok = GenServer.call(server, {:http_event, {:status, 503}})
+      assert :ok = GenServer.call(server, {:http_event, :done})
+
+      assert {:error, %ReqLLM.Error.API.Request{} = error} = StreamServer.next(server, 100)
+      assert error.status == 503
+      assert error.reason == "HTTP 503"
+      assert error.response_body == nil
+      assert error.retryable == true
 
       StreamServer.cancel(server)
     end
@@ -118,6 +153,7 @@ defmodule ReqLLM.StreamServer.ErrorHandlingTest do
       assert error.status == 404
       assert error.reason == "HTTP 404"
       assert error.response_body == "Not Found"
+      assert error.retryable == false
 
       StreamServer.cancel(server)
     end

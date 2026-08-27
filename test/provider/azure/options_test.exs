@@ -173,7 +173,7 @@ defmodule ReqLLM.Providers.Azure.OptionsTest do
     end
 
     test "OpenAI reasoning_effort passes through for o1 models" do
-      {:ok, model} = ReqLLM.model("azure:o1-mini")
+      {:ok, model} = ReqLLM.model("azure:o1")
 
       {opts, _warnings} =
         Azure.translate_options(

@@ -7,6 +7,7 @@ defmodule ReqLLM.Providers.GoogleVertex.Auth do
   """
 
   alias ReqLLM.Provider.Utils
+  alias ReqLLM.Providers.GoogleVertex.GothAdapter
 
   require Logger
 
@@ -200,7 +201,7 @@ defmodule ReqLLM.Providers.GoogleVertex.Auth do
 
     request =
       Req.new(
-        finch: ReqLLM.Application.finch_name(),
+        finch: [name: ReqLLM.Application.finch_name()],
         url: @token_uri,
         method: :post,
         body: body,
@@ -356,11 +357,8 @@ defmodule ReqLLM.Providers.GoogleVertex.Auth do
   defp normalize_goth_http_client(other), do: other
 
   defp fetch_goth_token(config) do
-    case Goth.Token.fetch(config) do
-      {:ok, %Goth.Token{token: token, expires: expires_at}} ->
-        # Goth reports the raw expiry; apply the same safety margin as the
-        # service-account path so cached tokens are never served moments
-        # before they die.
+    case GothAdapter.fetch_token(config) do
+      {:ok, %{token: token, expires_at: expires_at}} ->
         {:ok, %{token: token, expires_at: expires_at - @safety_margin_seconds}}
 
       {:error, reason} ->

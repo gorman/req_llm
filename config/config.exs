@@ -1,6 +1,7 @@
 import Config
 
 config :llm_db,
+  compile_embed: true,
   filter: %{
     allow: %{
       alibaba: ["*"],
@@ -17,7 +18,9 @@ config :llm_db,
       google_vertex: ["*"],
       google_vertex_anthropic: ["*"],
       groq: ["*"],
+      meta: ["*"],
       minimax: ["*"],
+      moonshotai: ["*"],
       openai: ["*"],
       openrouter: ["*"],
       venice: ["*"],

@@ -61,7 +61,7 @@ defmodule ReqLLM.StreamServer.MetadataTest do
           StreamServer.await_metadata(server, 200)
         end)
 
-      :timer.sleep(50)
+      assert :ok = await_waiting_callers(server, [:metadata])
       assert :ok = GenServer.call(server, {:http_event, :done})
 
       assert {:ok, metadata} = Task.await(metadata_task)
@@ -70,26 +70,103 @@ defmodule ReqLLM.StreamServer.MetadataTest do
       StreamServer.cancel(server)
     end
 
-    test "await_metadata returns error on stream failure" do
+    test "await_metadata returns terminal error metadata on stream failure" do
       server = start_server()
       _task = mock_http_task(server)
 
       error_reason = {:request_failed, "Network error"}
       assert :ok = GenServer.call(server, {:http_event, {:error, error_reason}})
 
-      assert {:error, ^error_reason} = StreamServer.await_metadata(server, 100)
+      assert {:ok, metadata} = StreamServer.await_metadata(server, 100)
+      assert metadata.error == error_reason
+      assert metadata.finish_reason == :error
 
       StreamServer.cancel(server)
     end
 
+    test "stream failure metadata preserves partial content and observed usage" do
+      server = start_server()
+      _task = mock_http_task(server)
+      server_ref = Process.monitor(server)
+
+      content = Jason.encode!(%{"choices" => [%{"delta" => %{"content" => "partial"}}]})
+      usage = Jason.encode!(%{"usage" => %{"prompt_tokens" => 4, "completion_tokens" => 2}})
+
+      StreamServer.http_event(server, {:data, "data: #{content}\n\n"})
+      StreamServer.http_event(server, {:data, "data: #{usage}\n\n"})
+
+      error = %Finch.TransportError{source: %Mint.TransportError{reason: :closed}}
+      StreamServer.http_event(server, {:error, error})
+
+      assert {:ok, content_chunk} = StreamServer.next(server, 100)
+      assert content_chunk.text == "partial"
+
+      assert {:ok, usage_chunk} = StreamServer.next(server, 100)
+      assert usage_chunk.metadata.usage["prompt_tokens"] == 4
+
+      assert {:ok, metadata} = StreamServer.await_metadata(server, 100)
+      assert metadata.error == error
+      assert metadata.finish_reason == :error
+      assert metadata.usage.input_tokens == 4
+      assert metadata.usage.output_tokens == 2
+
+      assert {:error, ^error} = StreamServer.next(server, 100)
+      assert_receive {:DOWN, ^server_ref, :process, ^server, :normal}, 100
+    end
+
+    test "cancellation replies to all metadata waiters with partial usage" do
+      server = start_server()
+      _task = mock_http_task(server)
+
+      usage = %{"prompt_tokens" => 10, "completion_tokens" => 5, "total_tokens" => 15}
+      payload = Jason.encode!(%{"usage" => usage})
+
+      StreamServer.http_event(server, {:data, "data: #{payload}\n\n"})
+
+      metadata_tasks =
+        for _index <- 1..2 do
+          Task.async(fn -> StreamServer.await_metadata(server, :infinity) end)
+        end
+
+      await_metadata_waiters(server, 2)
+
+      assert :ok = StreamServer.cancel(server)
+
+      results = Task.await_many(metadata_tasks)
+      assert length(results) == 2
+
+      Enum.each(results, fn result ->
+        assert {:ok, metadata} = result
+        assert metadata.finish_reason == :cancelled
+        assert metadata.usage.input_tokens == 10
+        assert metadata.usage.output_tokens == 5
+        assert metadata.usage.total_tokens == 15
+      end)
+    end
+
     test "stops after normal HTTP task completion once halt and metadata are delivered" do
       server = start_server()
-      task = Task.async(fn -> Process.sleep(20) end)
+      parent = self()
+
+      task =
+        Task.async(fn ->
+          send(parent, {:http_task_ready, self()})
+
+          receive do
+            :complete -> :ok
+          end
+        end)
+
+      assert_receive {:http_task_ready, task_pid}
+      assert task_pid == task.pid
 
       StreamServer.attach_http_task(server, task.pid)
 
       next_task = Task.async(fn -> StreamServer.next(server, 200) end)
       metadata_task = Task.async(fn -> StreamServer.await_metadata(server, 200) end)
+
+      assert :ok = await_waiting_callers(server, [:next, :metadata])
+      send(task.pid, :complete)
 
       assert :halt = Task.await(next_task)
       assert {:ok, metadata} = Task.await(metadata_task)
@@ -156,7 +233,7 @@ defmodule ReqLLM.StreamServer.MetadataTest do
       _task = mock_http_task(server)
 
       metadata_task = Task.async(fn -> StreamServer.await_metadata(server, 500) end)
-      :timer.sleep(20)
+      assert :ok = await_waiting_callers(server, [:metadata])
 
       finish_payload =
         Jason.encode!(%{
@@ -183,5 +260,20 @@ defmodule ReqLLM.StreamServer.MetadataTest do
 
       StreamServer.cancel(server)
     end
+  end
+
+  defp await_metadata_waiters(server, expected_count, attempts \\ 50)
+
+  defp await_metadata_waiters(server, expected_count, attempts) when attempts > 0 do
+    if length(:sys.get_state(server).waiting_callers) >= expected_count do
+      :ok
+    else
+      Process.sleep(5)
+      await_metadata_waiters(server, expected_count, attempts - 1)
+    end
+  end
+
+  defp await_metadata_waiters(_server, _expected_count, 0) do
+    flunk("metadata waiters were not registered")
   end
 end

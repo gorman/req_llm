@@ -37,18 +37,43 @@ defmodule ReqLLM.ProviderTest.Transcription do
 
         describe "#{model_spec}" do
           @tag category: :transcription
-          @tag scenario: :transcription_basic
+          @tag ReqLLM.Test.CompatibilityScenario.tag!(:transcription_basic)
           @tag model: model_spec |> String.split(":", parts: 2) |> List.last()
           test "basic audio transcription" do
             {:ok, result} =
               ReqLLM.transcribe(
                 @model_spec,
                 {:binary, ReqLLM.ProviderTest.Transcription.sample_audio(), "audio/wav"},
-                fixture_opts(@provider, "transcription_basic", language: "en")
+                fixture_opts(
+                  @provider,
+                  ReqLLM.Test.CompatibilityScenario.fixture!(:transcription_basic),
+                  language: "en"
+                )
               )
 
             assert is_binary(result.text)
             assert result.text != ""
+          end
+
+          @tag category: :transcription
+          @tag ReqLLM.Test.CompatibilityScenario.tag!(:transcription_basic)
+          @tag model: model_spec |> String.split(":", parts: 2) |> List.last()
+          test "detailed audio transcription reuses the provider fixture" do
+            {:ok, detailed} =
+              ReqLLM.transcribe_detailed(
+                @model_spec,
+                {:binary, ReqLLM.ProviderTest.Transcription.sample_audio(), "audio/wav"},
+                fixture_opts(
+                  @provider,
+                  ReqLLM.Test.CompatibilityScenario.fixture!(:transcription_basic),
+                  language: "en"
+                )
+              )
+
+            assert %ReqLLM.Transcription.DetailedResult{} = detailed
+            assert is_binary(detailed.result.text)
+            assert detailed.result.text != ""
+            assert detailed.call_metadata.provider == @provider
           end
         end
       end

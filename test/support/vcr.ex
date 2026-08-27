@@ -40,6 +40,7 @@ defmodule ReqLLM.Test.VCR do
       stream = VCR.replay_stream(transcript)
   """
 
+  alias ReqLLM.StreamServer
   alias ReqLLM.Test.{ChunkCollector, Transcript}
 
   @type provider :: atom()
@@ -233,7 +234,6 @@ defmodule ReqLLM.Test.VCR do
 
     task =
       Task.async(fn ->
-        Process.sleep(10)
         feed_transcript_to_server(stream_server_pid, transcript)
       end)
 
@@ -244,16 +244,16 @@ defmodule ReqLLM.Test.VCR do
     Enum.each(events, fn event ->
       case event do
         {:status, code} ->
-          GenServer.call(server, {:http_event, {:status, code}})
+          StreamServer.http_event(server, {:status, code})
 
         {:headers, headers} ->
-          GenServer.call(server, {:http_event, {:headers, headers}})
+          StreamServer.http_event(server, {:headers, headers})
 
         {:data, binary} ->
-          GenServer.call(server, {:http_event, {:data, binary}})
+          StreamServer.http_event(server, {:data, binary})
 
         {:done, :ok} ->
-          GenServer.call(server, {:http_event, :done})
+          StreamServer.http_event(server, :done)
 
         _ ->
           :ok
@@ -364,9 +364,7 @@ defmodule ReqLLM.Test.VCR do
         model: model
       )
 
-    # Feed transcript events to server
     Task.async(fn ->
-      Process.sleep(10)
       feed_transcript_to_server(server, transcript)
     end)
 

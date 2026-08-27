@@ -22,6 +22,7 @@ defmodule ReqLLM.Response do
   """
 
   alias ReqLLM.Message
+  alias ReqLLM.Response.OutputItem
   alias ReqLLM.ToolCall
 
   @derive {Jason.Encoder, except: [:stream]}
@@ -54,6 +55,26 @@ defmodule ReqLLM.Response do
 
   @type t :: unquote(Zoi.type_spec(@schema))
 
+  @typedoc """
+  Computed metadata for one model interaction.
+
+  Optional keys are present only when their values were retained by the
+  provider path. `attempts` never includes separate model interactions from
+  the response context.
+  """
+  @type call_metadata :: %{
+          required(:response_id) => String.t(),
+          required(:model) => String.t(),
+          optional(:finish_reason) => atom(),
+          optional(:usage) => map(),
+          optional(:request_id) => String.t(),
+          optional(:raw_finish_reason) => String.t() | atom(),
+          optional(:warnings) => [String.t()],
+          optional(:attempts) => non_neg_integer(),
+          optional(:timings) => map(),
+          optional(:provider_metadata) => map()
+        }
+
   @enforce_keys Zoi.Struct.enforce_keys(@schema)
   defstruct Zoi.Struct.struct_fields(@schema)
 
@@ -79,6 +100,38 @@ defmodule ReqLLM.Response do
     content
     |> Enum.filter(&(&1.type == :text))
     |> Enum.map_join("", & &1.text)
+  end
+
+  @doc """
+  Projects the value described by a `ReqLLM.Output` descriptor.
+
+  This is a computed view over the unchanged response. Plain text delegates to
+  `text/1`; object output uses the existing `object` value; array, choice, and
+  JSON outputs unwrap the private compatibility envelope used by providers that
+  require a top-level object schema.
+
+  Raw text, structured tool-call arguments, usage, and provider metadata remain
+  available through their existing accessors. This projection follows the
+  current V1 structured-output validation and repair behavior.
+  """
+  @spec output(t(), ReqLLM.Output.t()) :: term()
+  def output(%__MODULE__{} = response, %ReqLLM.Output{} = descriptor) do
+    ReqLLM.Output.value(descriptor, response)
+  end
+
+  @doc """
+  Returns a visible final-value report for an output descriptor.
+
+  The report separates retained raw output, the projected value, final validity,
+  validation errors, warnings, extraction source, repair attempts, and provider
+  metadata. It is computed locally and never triggers another model call.
+
+  `:policy` defaults to the policy recorded by generation, or `:compatible` when
+  no policy was explicitly selected.
+  """
+  @spec output_result(t(), ReqLLM.Output.t(), keyword()) :: ReqLLM.Output.Result.t()
+  def output_result(%__MODULE__{} = response, %ReqLLM.Output{} = descriptor, opts \\ []) do
+    ReqLLM.Output.result(response, descriptor, opts)
   end
 
   @doc """
@@ -150,15 +203,19 @@ defmodule ReqLLM.Response do
   Extract tool calls from the response message.
 
   Returns a list of tool calls if the message contains them, empty list otherwise.
-  Always returns normalized maps with `.name` and `.arguments` fields.
+  Provider responses expose tool calls as `ReqLLM.ToolCall` structs. Use struct
+  field access such as `call.id` and `call.function.name`, or call
+  `ReqLLM.ToolCall.to_map/1` when you need decoded arguments in a plain map.
+  Use `classify/1` when you want response text, finish reason, and normalized
+  tool call maps in one value.
 
   ## Examples
 
       iex> ReqLLM.Response.tool_calls(response)
-      [%{name: "get_weather", arguments: %{location: "San Francisco"}}]
+      [%ReqLLM.ToolCall{id: "call_123", type: "function", function: %{name: "get_weather", arguments: ~s({"location":"San Francisco"})}}]
 
   """
-  @spec tool_calls(t()) :: [term()]
+  @spec tool_calls(t()) :: [ToolCall.t()]
   def tool_calls(%__MODULE__{message: nil}), do: []
 
   def tool_calls(%__MODULE__{message: %Message{tool_calls: tool_calls}})
@@ -167,6 +224,99 @@ defmodule ReqLLM.Response do
   end
 
   def tool_calls(%__MODULE__{message: %Message{tool_calls: nil}}), do: []
+
+  @doc """
+  Return a deterministic canonical projection of values retained by this response.
+
+  Message content keeps its existing order. Tool calls follow content because
+  the V1 `ReqLLM.Message` contract stores tool calls separately and does not
+  retain their original interleaving. Sources, annotations, refusals, and
+  provider-native items retained only in metadata follow the message values.
+
+  This function does not add fields to or mutate `ReqLLM.Response`.
+  """
+  @spec output_items(t()) :: [OutputItem.t()]
+  def output_items(%__MODULE__{} = response) do
+    ReqLLM.Response.Projection.output_items(response)
+  end
+
+  @doc "Returns canonical output items grouped into stable result channels."
+  @spec channels(t()) :: %{OutputItem.channel() => [OutputItem.t()]}
+  def channels(%__MODULE__{} = response) do
+    items = output_items(response)
+
+    Map.new(OutputItem.channels(), fn channel ->
+      {channel, Enum.filter(items, &(OutputItem.channel(&1) == channel))}
+    end)
+  end
+
+  @doc "Returns canonical output items for one stable result channel."
+  @spec channel_items(t(), OutputItem.channel()) :: [OutputItem.t()]
+  def channel_items(%__MODULE__{} = response, channel) do
+    response
+    |> output_items()
+    |> Enum.filter(&(OutputItem.channel(&1) == channel))
+  end
+
+  @doc "Returns generated file content parts retained by this response."
+  @spec files(t()) :: [ReqLLM.Message.ContentPart.t()]
+  def files(%__MODULE__{} = response) do
+    response
+    |> output_items()
+    |> Enum.flat_map(fn
+      %OutputItem{type: :file, data: %ReqLLM.Message.ContentPart{} = part} -> [part]
+      _item -> []
+    end)
+  end
+
+  @doc "Returns source values retained by content or provider metadata."
+  @spec sources(t()) :: [term()]
+  def sources(%__MODULE__{} = response) do
+    response
+    |> channel_items(:sources)
+    |> Enum.map(& &1.data)
+  end
+
+  @doc "Returns annotation values retained by content or provider metadata."
+  @spec annotations(t()) :: [term()]
+  def annotations(%__MODULE__{} = response) do
+    response
+    |> channel_items(:annotations)
+    |> Enum.map(& &1.data)
+  end
+
+  @doc "Returns refusal values retained by content or provider metadata."
+  @spec refusals(t()) :: [term()]
+  def refusals(%__MODULE__{} = response) do
+    response
+    |> channel_items(:refusals)
+    |> Enum.map(& &1.data)
+  end
+
+  @doc "Returns provider-native output values retained by this response."
+  @spec provider_items(t()) :: [term()]
+  def provider_items(%__MODULE__{} = response) do
+    response
+    |> channel_items(:provider)
+    |> Enum.map(& &1.data)
+  end
+
+  @doc """
+  Return a redacted call-metadata projection over existing response values.
+
+  The projection includes response identity, normalized finish reason, usage,
+  and safe provider metadata when available. Request IDs, raw finish reasons,
+  warnings, attempt counts, and timings are omitted unless the provider path
+  already retained them. Credentials, prompts, file payloads, and hidden
+  reasoning metadata are redacted recursively.
+
+  This function does not enable additional provider capture or alter legacy
+  response serialization.
+  """
+  @spec call_metadata(t()) :: call_metadata()
+  def call_metadata(%__MODULE__{} = response) do
+    ReqLLM.Response.Projection.call_metadata(response)
+  end
 
   @typedoc """
   Result of classifying a non-streaming response.

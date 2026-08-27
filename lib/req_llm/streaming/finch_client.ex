@@ -26,7 +26,7 @@ defmodule ReqLLM.Streaming.FinchClient do
   requests with proper authentication, headers, and request body formatting.
   """
 
-  alias ReqLLM.Streaming.{Fixtures, Retry}
+  alias ReqLLM.Streaming.{Failure, Fixtures, Retry}
   alias ReqLLM.Streaming.Fixtures.HTTPContext
   alias ReqLLM.StreamServer
 
@@ -98,8 +98,8 @@ defmodule ReqLLM.Streaming.FinchClient do
     end
   end
 
-  # Build Finch.Request using provider callback
-  defp build_stream_request(provider_mod, model, context, opts, finch_name) do
+  @doc false
+  def build_stream_request(provider_mod, model, context, opts, finch_name) do
     alias ReqLLM.Streaming.Fixtures
 
     with {:ok, finch_request} <- provider_mod.attach_stream(model, context, opts, finch_name),
@@ -162,57 +162,11 @@ defmodule ReqLLM.Streaming.FinchClient do
       finch_request
       |> Fixtures.canonical_json_from_finch_request()
       |> stream_options(opts)
+      |> Keyword.put(:on_retry, fn retry -> StreamServer.retry_event(stream_server_pid, retry) end)
 
     task_pid =
       Task.Supervisor.async(ReqLLM.TaskSupervisor, fn ->
-        finch_stream_callback = fn
-          {:status, status}, acc ->
-            safe_http_event(stream_server_pid, {:status, status})
-            acc
-
-          {:headers, headers}, acc ->
-            safe_http_event(stream_server_pid, {:headers, headers})
-            acc
-
-          {:data, chunk}, acc ->
-            safe_http_event(stream_server_pid, {:data, chunk})
-            acc
-
-          :done, acc ->
-            safe_http_event(stream_server_pid, :done)
-            acc
-        end
-
-        try do
-          case Retry.stream(
-                 finch_request,
-                 finch_name,
-                 :ok,
-                 finch_stream_callback,
-                 stream_opts
-               ) do
-            {:ok, _} ->
-              :ok
-
-            {:error, reason, _callback_acc} ->
-              Logger.error("Finch streaming failed: #{inspect(reason)}")
-              safe_http_event(stream_server_pid, {:error, reason})
-              {:error, reason}
-          end
-        catch
-          :exit, reason ->
-            Logger.error("Finch streaming task exited: #{inspect(reason)}")
-            safe_http_event(stream_server_pid, {:error, {:exit, reason}})
-            {:error, {:exit, reason}}
-
-          kind, reason ->
-            Logger.error(
-              "Finch streaming task crashed (kind=#{inspect(kind)}): #{inspect(reason)}"
-            )
-
-            safe_http_event(stream_server_pid, {:error, {kind, reason}})
-            {:error, {kind, reason}}
-        end
+        run_stream_with_options(finch_request, stream_server_pid, finch_name, stream_opts)
       end)
 
     {:ok, task_pid.pid}
@@ -220,6 +174,59 @@ defmodule ReqLLM.Streaming.FinchClient do
     error ->
       Logger.error("Failed to start streaming task: #{inspect(error)}")
       {:error, {:task_start_failed, error}}
+  end
+
+  @doc false
+  def run_stream(finch_request, stream_server_pid, finch_name, opts) do
+    stream_opts =
+      finch_request
+      |> Fixtures.canonical_json_from_finch_request()
+      |> stream_options(opts)
+      |> Keyword.put(:on_retry, fn retry -> StreamServer.retry_event(stream_server_pid, retry) end)
+
+    run_stream_with_options(finch_request, stream_server_pid, finch_name, stream_opts)
+  end
+
+  defp run_stream_with_options(finch_request, stream_server_pid, finch_name, stream_opts) do
+    finch_stream_callback = fn
+      {:status, status}, acc ->
+        safe_http_event(stream_server_pid, {:status, status})
+        acc
+
+      {:headers, headers}, acc ->
+        safe_http_event(stream_server_pid, {:headers, headers})
+        acc
+
+      {:data, chunk}, acc ->
+        safe_http_event(stream_server_pid, {:data, chunk})
+        acc
+
+      :done, acc ->
+        safe_http_event(stream_server_pid, :done)
+        acc
+    end
+
+    try do
+      case Retry.stream(finch_request, finch_name, :ok, finch_stream_callback, stream_opts) do
+        {:ok, _} -> :ok
+        {:error, reason, _callback_acc} -> forward_stream_failure(stream_server_pid, reason)
+      end
+    catch
+      :exit, reason -> forward_stream_failure(stream_server_pid, {:exit, reason})
+      kind, reason -> forward_stream_failure(stream_server_pid, {kind, reason})
+    end
+  end
+
+  defp forward_stream_failure(stream_server_pid, reason) do
+    case Failure.log(reason) do
+      :cancelled ->
+        safe_http_event(stream_server_pid, {:cancelled, reason})
+
+      _classification ->
+        safe_http_event(stream_server_pid, {:error, reason})
+    end
+
+    {:error, reason}
   end
 
   @doc false
@@ -293,9 +300,10 @@ defmodule ReqLLM.Streaming.FinchClient do
   end
 
   defp default_pool_timeout(receive_timeout) do
-    case Application.get_env(:req_llm, :stream_pool_timeout) do
-      nil -> receive_timeout
-      timeout -> timeout
+    case Application.fetch_env(:req_llm, :stream_pool_timeout) do
+      {:ok, timeout} -> timeout
+      :error when receive_timeout == :infinity -> 30_000
+      :error -> receive_timeout
     end
   end
 

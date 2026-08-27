@@ -22,7 +22,8 @@ defmodule ReqLLM.Step.Retry do
 
   - **Max retries**: 3 attempts (4 total requests including initial)
   - **Retry delay**: 0ms (instant retry)
-  - **Retryable errors**: Only transient `Req.TransportError` types
+  - **Retryable errors**: Transient transport errors, whether they arrive as a bare
+    `Req.TransportError` or wrapped in a `ReqLLM.Error.API.Request`
   - **Non-retryable errors**: Application errors, HTTP errors, etc. are not retried
 
   ## Examples
@@ -37,6 +38,10 @@ defmodule ReqLLM.Step.Retry do
       # it will be retried up to 3 times before giving up.
   """
 
+  # Transient transport reasons retried instantly (`{:delay, 0}`), whether the error
+  # arrives as a bare `Req.TransportError` or wrapped in a `ReqLLM.Error.API.Request`.
+  @transient_reasons [:closed, :timeout, :econnrefused]
+
   @doc """
   Attaches the Retry configuration to a Req request struct.
 
@@ -50,7 +55,7 @@ defmodule ReqLLM.Step.Retry do
   """
   @spec attach(Req.Request.t(), keyword()) :: Req.Request.t()
   def attach(%Req.Request{} = req, opts \\ []) do
-    max_retries = Keyword.get(opts, :max_retries, 3)
+    max_retries = Keyword.get(opts, :max_retries, Map.get(req.options, :max_retries, 3))
 
     req
     |> Req.Request.merge_options(
@@ -60,6 +65,13 @@ defmodule ReqLLM.Step.Retry do
       # Setting both causes ArgumentError in Req 0.5.15+
       retry_log_level: false
     )
+    |> Req.Request.append_request_steps(llm_retry_attempt: &mark_attempt_start/1)
+  end
+
+  @doc false
+  @spec mark_attempt_start(Req.Request.t()) :: Req.Request.t()
+  def mark_attempt_start(request) do
+    Req.Request.put_private(request, :req_llm_attempt_started_at, System.monotonic_time())
   end
 
   @doc """
@@ -89,27 +101,69 @@ defmodule ReqLLM.Step.Retry do
       iex> ReqLLM.Step.Retry.should_retry?(%Req.Request{}, %Req.TransportError{reason: :timeout})
       {:delay, 0}
 
+      iex> ReqLLM.Step.Retry.should_retry?(%Req.Request{}, %ReqLLM.Error.API.Request{cause: %Req.TransportError{reason: :closed}})
+      {:delay, 0}
+
       iex> ReqLLM.Step.Retry.should_retry?(%Req.Request{}, %RuntimeError{})
       false
   """
   @spec should_retry?(Req.Request.t(), Req.Response.t() | Exception.t()) ::
           boolean() | {:delay, non_neg_integer()}
-  def should_retry?(_request, %Req.TransportError{reason: reason})
-      when reason in [:closed, :timeout, :econnrefused] do
-    {:delay, 0}
+  def should_retry?(request, %Req.TransportError{reason: reason})
+      when reason in @transient_reasons do
+    retry(request, 0, nil)
   end
 
-  def should_retry?(_request, %Req.Response{status: 429} = response) do
+  def should_retry?(request, %Req.Response{status: 429} = response) do
     retry_after = extract_retry_after_delay(response.headers)
-    {:delay, retry_after}
+    retry(request, retry_after, 429)
   end
 
-  def should_retry?(_request, %ReqLLM.Error.API.Request{status: 429, headers: headers}) do
+  def should_retry?(request, %ReqLLM.Error.API.Request{status: 429, headers: headers}) do
     retry_after = extract_retry_after_delay(headers)
-    {:delay, retry_after}
+    retry(request, retry_after, 429)
+  end
+
+  # Transport failures often surface wrapped in a ReqLLM.Error.API.Request rather than
+  # as a bare Req.TransportError — e.g. a stale pooled connection closed on reuse
+  # arrives as %ReqLLM.Error.API.Request{cause: %Finch.TransportError{reason: :closed}}.
+  # Retry the same transient reasons so these aren't silently dropped by the clause
+  # below despite matching the retry intent.
+  def should_retry?(request, %ReqLLM.Error.API.Request{
+        cause: %{__struct__: mod, reason: reason}
+      })
+      when mod in [Finch.TransportError, Mint.TransportError, Req.TransportError] and
+             reason in @transient_reasons do
+    retry(request, 0, nil)
   end
 
   def should_retry?(_request, _response_or_exception), do: false
+
+  defp retry(request, delay, http_status) do
+    retry_count = Req.Request.get_private(request, :req_retry_count, 0)
+    max_retries = Req.Request.get_option(request, :max_retries, 3)
+    started_at = Req.Request.get_private(request, :req_llm_attempt_started_at)
+
+    duration =
+      if is_integer(started_at) do
+        System.monotonic_time() - started_at
+      else
+        0
+      end
+
+    if retry_count < max_retries do
+      ReqLLM.Telemetry.retry_request(ReqLLM.Telemetry.request_context(request), %{
+        attempt: retry_count + 1,
+        next_attempt: retry_count + 2,
+        max_retries: max_retries,
+        delay: delay,
+        duration: duration,
+        http_status: http_status
+      })
+    end
+
+    {:delay, delay}
+  end
 
   defp extract_retry_after_delay(headers) when is_list(headers) do
     retry_after =

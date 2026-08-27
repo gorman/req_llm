@@ -24,45 +24,118 @@ defmodule ReqLLM.StreamServer.StreamingTest do
   end
 
   describe "backpressure handling" do
-    test "applies backpressure when queue exceeds high_watermark" do
-      server = start_server(high_watermark: 2)
-      _task = mock_http_task(server)
+    test "bounds queued chunks and fixture data until consumer demand resumes" do
+      server = start_server(high_watermark: 1, fixture_path: "unused-stream-fixture.json")
+      parent = self()
 
-      for i <- 1..5 do
-        sse_data = ~s(data: {"choices": [{"delta": {"content": "#{i}"}}]}\n\n)
-        GenServer.call(server, {:http_event, {:data, sse_data}})
-      end
+      events =
+        for text <- ["one", "two", "three"] do
+          {text, ~s(data: {"choices": [{"delta": {"content": "#{text}"}}]}\n\n)}
+        end
 
-      assert {:ok, chunk1} = StreamServer.next(server, 100)
-      assert chunk1.text == "1"
+      producer =
+        Task.async(fn ->
+          Enum.each(events, fn {text, event} ->
+            send(parent, {:producer_sending, text})
+            :ok = StreamServer.http_event(server, {:data, event})
+            send(parent, {:producer_acknowledged, text})
+          end)
+        end)
 
-      assert {:ok, chunk2} = StreamServer.next(server, 100)
-      assert chunk2.text == "2"
+      expected_raw_bytes =
+        Enum.reduce(events, 0, fn {text, event}, raw_bytes ->
+          assert_receive {:producer_sending, ^text}
+          expected_raw_bytes = raw_bytes + byte_size(event)
+          assert :ok = wait_for_backpressure(server, expected_raw_bytes)
+          refute_received {:producer_acknowledged, ^text}
+
+          assert {:ok, chunk} = StreamServer.next(server, 100)
+          assert chunk.text == text
+          assert_receive {:producer_acknowledged, ^text}
+
+          expected_raw_bytes
+        end)
+
+      assert expected_raw_bytes ==
+               Enum.sum(Enum.map(events, fn {_text, event} -> byte_size(event) end))
+
+      assert :ok = Task.await(producer)
+      assert :ok = StreamServer.http_event(server, :done)
+      assert :halt = StreamServer.next(server, 100)
 
       StreamServer.cancel(server)
     end
 
-    test "resumes processing after queue drains below watermark" do
+    test "cancellation releases a suspended producer" do
       server = start_server(high_watermark: 1)
-      _task = mock_http_task(server)
+      first = ~s(data: {"choices": [{"delta": {"content": "first"}}]}\n\n)
+      second = ~s(data: {"choices": [{"delta": {"content": "second"}}]}\n\n)
+      first_producer = Task.async(fn -> StreamServer.http_event(server, {:data, first}) end)
 
-      sse_data1 = ~s(data: {"choices": [{"delta": {"content": "First"}}]}\n\n)
-      sse_data2 = ~s(data: {"choices": [{"delta": {"content": "Second"}}]}\n\n)
+      assert :ok = wait_for_backpressure(server)
 
-      assert :ok = GenServer.call(server, {:http_event, {:data, sse_data1}})
+      second_producer = Task.async(fn -> StreamServer.http_event(server, {:data, second}) end)
+      assert :ok = wait_for_pending_http_call(server)
 
-      data_task =
-        Task.async(fn ->
-          GenServer.call(server, {:http_event, {:data, sse_data2}})
+      assert :ok = StreamServer.cancel(server)
+      assert :ok = Task.await(first_producer)
+      assert :ok = Task.await(second_producer)
+    end
+
+    test "consumer termination releases a suspended producer" do
+      server = start_server(high_watermark: 1)
+
+      consumer =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
         end)
 
-      assert {:ok, chunk} = StreamServer.next(server, 100)
-      assert chunk.text == "First"
+      assert :ok = StreamServer.monitor_consumer(server, consumer)
 
-      assert :ok = Task.await(data_task)
+      event = ~s(data: {"choices": [{"delta": {"content": "blocked"}}]}\n\n)
+      producer = Task.async(fn -> StreamServer.http_event(server, {:data, event}) end)
+      server_ref = Process.monitor(server)
+
+      assert :ok = wait_for_backpressure(server)
+      Process.exit(consumer, :cancelled)
+
+      assert :ok = Task.await(producer)
+      assert_receive {:DOWN, ^server_ref, :process, ^server, :normal}
+    end
+
+    test "telemetry deferral cannot bypass the watermark" do
+      server = start_server(high_watermark: 2)
+      :sys.replace_state(server, &%{&1 | telemetry_pending?: true})
+
+      event = """
+      data: {"choices": [{"delta": {"content": "one"}}]}
+
+      data: {"choices": [{"delta": {"content": "two"}}]}
+
+      data: {"choices": [{"delta": {"content": "three"}}]}
+
+      """
+
+      producer = Task.async(fn -> StreamServer.http_event(server, {:data, event}) end)
+
+      assert :ok = wait_for_telemetry_backpressure(server)
+      assert Process.alive?(producer.pid)
+
+      assert :ok = StreamServer.set_telemetry_context(server, nil)
+      assert Process.alive?(producer.pid)
 
       assert {:ok, chunk} = StreamServer.next(server, 100)
-      assert chunk.text == "Second"
+      assert chunk.text == "one"
+      assert Process.alive?(producer.pid)
+
+      assert {:ok, chunk} = StreamServer.next(server, 100)
+      assert chunk.text == "two"
+      assert :ok = Task.await(producer)
+
+      assert {:ok, chunk} = StreamServer.next(server, 100)
+      assert chunk.text == "three"
 
       StreamServer.cancel(server)
     end
@@ -219,18 +292,121 @@ defmodule ReqLLM.StreamServer.StreamingTest do
   end
 
   describe "timeout handling" do
+    test "total timeout finalizes the stream and stops its transport" do
+      server = start_server(total_timeout: 60)
+      task = mock_http_task(server)
+      :ok = StreamServer.set_telemetry_context(server, nil)
+
+      assert {:ok, metadata} = StreamServer.await_metadata(server, 500)
+      assert metadata.finish_reason == :error
+
+      assert %ReqLLM.Error.API.Timeout{kind: :total, timeout: 60} = metadata.error
+
+      assert {:error, %ReqLLM.Error.API.Timeout{kind: :total, timeout: 60}} =
+               StreamServer.next(server, 100)
+
+      refute Process.alive?(task.pid)
+    end
+
+    test "total timeout stops streaming retries" do
+      test_pid = self()
+      server = start_server(total_timeout: 250)
+
+      task =
+        Task.async(fn ->
+          stream_fun = fn _request, _finch_name, acc, _callback, _opts ->
+            send(test_pid, :stream_budget_attempt)
+            Process.sleep(150)
+            {:error, %Mint.TransportError{reason: :closed}, acc}
+          end
+
+          ReqLLM.Streaming.Retry.stream(
+            Finch.build(:post, "https://example.com/stream"),
+            ReqLLM.Finch,
+            :ok,
+            fn _event, acc -> acc end,
+            [max_retries: 3, receive_timeout: 1_000],
+            stream_fun
+          )
+        end)
+
+      StreamServer.attach_http_task(server, task.pid)
+
+      assert_receive :stream_budget_attempt, 1_000
+      :ok = StreamServer.set_telemetry_context(server, nil)
+      assert_receive :stream_budget_attempt, 300
+      assert {:ok, metadata} = StreamServer.await_metadata(server, 500)
+      assert %ReqLLM.Error.API.Timeout{kind: :total, timeout: 250} = metadata.error
+      refute_received :stream_budget_attempt
+      refute Process.alive?(task.pid)
+    end
+
+    test "stream idle timeout finalizes after semantic inactivity" do
+      server = start_server(stream_idle_timeout: 60)
+      task = mock_http_task(server)
+      :ok = StreamServer.set_telemetry_context(server, nil)
+
+      assert {:ok, metadata} = StreamServer.await_metadata(server, 500)
+      assert metadata.finish_reason == :error
+
+      assert %ReqLLM.Error.API.Timeout{kind: :stream_idle, timeout: 60} = metadata.error
+
+      assert {:error, %ReqLLM.Error.API.Timeout{kind: :stream_idle, timeout: 60}} =
+               StreamServer.next(server, 100)
+
+      refute Process.alive?(task.pid)
+    end
+
+    test "semantic progress resets the stream idle budget" do
+      server = start_server(stream_idle_timeout: 120)
+      _task = mock_http_task(server)
+      :ok = StreamServer.set_telemetry_context(server, nil)
+
+      Process.sleep(80)
+
+      StreamServer.http_event(
+        server,
+        {:data, ~s(data: {"choices": [{"delta": {"content": "progress"}}]}\n\n)}
+      )
+
+      assert {:error, :timeout} = StreamServer.await_metadata(server, 60)
+      assert {:ok, chunk} = StreamServer.next(server, 100)
+      assert chunk.text == "progress"
+
+      assert {:ok, metadata} = StreamServer.await_metadata(server, 200)
+      assert %ReqLLM.Error.API.Timeout{kind: :stream_idle} = metadata.error
+    end
+
+    test "keepalive metadata does not reset the stream idle budget" do
+      server = start_server(stream_idle_timeout: 200)
+      _task = mock_http_task(server)
+      :ok = StreamServer.set_telemetry_context(server, nil)
+
+      for _iteration <- 1..3 do
+        Process.sleep(50)
+        StreamServer.http_event(server, {:data, ~s(data: {"event": "keepalive"}\n\n)})
+      end
+
+      assert {:ok, metadata} = StreamServer.await_metadata(server, 120)
+      assert %ReqLLM.Error.API.Timeout{kind: :stream_idle, timeout: 200} = metadata.error
+    end
+
     test "next/2 respects timeout parameter" do
       server = start_server()
       _task = mock_http_task(server)
+      timeout = 5_000
 
-      start_time = :os.system_time(:millisecond)
+      timeout_task = Task.async(fn -> StreamServer.next(server, timeout) end)
+      assert :ok = await_waiting_callers(server, [:next])
 
-      assert {:error, :timeout} = StreamServer.next(server, 50)
+      assert %{waiting_callers: [waiting_caller]} = :sys.get_state(server)
 
-      elapsed = :os.system_time(:millisecond) - start_time
+      assert %{timer: timer, timeout: ^timeout, token: token, type: :next} = waiting_caller
+      assert Process.read_timer(timer) in 1..timeout
+      assert nil == Task.yield(timeout_task, 0)
 
-      assert elapsed >= 50
-      assert elapsed < 250
+      send(server, {:caller_timeout, token})
+      assert {:error, :timeout} = Task.await(timeout_task, 5_000)
 
       StreamServer.cancel(server)
     end
@@ -238,15 +414,48 @@ defmodule ReqLLM.StreamServer.StreamingTest do
     test "await_metadata/2 respects timeout parameter" do
       server = start_server()
       _task = mock_http_task(server)
+      timeout = 5_000
 
-      start_time = :os.system_time(:millisecond)
+      timeout_task = Task.async(fn -> StreamServer.await_metadata(server, timeout) end)
+      assert :ok = await_waiting_callers(server, [:metadata])
 
-      assert {:error, :timeout} = StreamServer.await_metadata(server, 50)
+      assert %{waiting_callers: [waiting_caller]} = :sys.get_state(server)
 
-      elapsed = :os.system_time(:millisecond) - start_time
+      assert %{timer: timer, timeout: ^timeout, token: token, type: :metadata} = waiting_caller
+      assert Process.read_timer(timer) in 1..timeout
+      assert nil == Task.yield(timeout_task, 0)
 
-      assert elapsed >= 50
-      assert elapsed < 250
+      send(server, {:caller_timeout, token})
+      assert {:error, :timeout} = Task.await(timeout_task, 5_000)
+
+      StreamServer.cancel(server)
+    end
+
+    test "await_metadata/2 resets a finite timeout on semantic progress" do
+      server = start_server()
+      _task = mock_http_task(server)
+
+      metadata_task = Task.async(fn -> StreamServer.await_metadata(server, 250) end)
+
+      Process.sleep(150)
+
+      StreamServer.http_event(
+        server,
+        {:data, ~s(data: {"choices": [{"delta": {"content": "one"}}]}\n\n)}
+      )
+
+      Process.sleep(150)
+
+      StreamServer.http_event(
+        server,
+        {:data, ~s(data: {"choices": [{"delta": {"content": "two"}}]}\n\n)}
+      )
+
+      Process.sleep(150)
+      StreamServer.http_event(server, :done)
+
+      assert {:ok, metadata} = Task.await(metadata_task, 500)
+      assert metadata.finish_reason == :incomplete
 
       StreamServer.cancel(server)
     end
@@ -260,18 +469,66 @@ defmodule ReqLLM.StreamServer.StreamingTest do
           StreamServer.next(server, 50)
         end)
 
-      spawn(fn ->
-        :timer.sleep(1200)
-        GenServer.call(server, {:http_event, {:error, :transport_timeout}})
-      end)
-
       assert {:error, :timeout} = Task.await(timeout_task, 500)
 
-      :timer.sleep(1250)
+      StreamServer.http_event(server, {:error, :transport_timeout})
 
       assert {:error, :transport_timeout} = StreamServer.next(server, 100)
 
       StreamServer.cancel(server)
+    end
+  end
+
+  defp wait_for_backpressure(server, expected_raw_bytes \\ nil, attempts \\ 100)
+
+  defp wait_for_backpressure(_server, _expected_raw_bytes, 0) do
+    flunk("StreamServer did not apply backpressure")
+  end
+
+  defp wait_for_backpressure(server, expected_raw_bytes, attempts) do
+    state = :sys.get_state(server)
+
+    raw_bytes_match? = is_nil(expected_raw_bytes) or state.raw_bytes == expected_raw_bytes
+
+    if state.blocked_http_event && :queue.len(state.queue) == 1 && raw_bytes_match? do
+      :ok
+    else
+      Process.sleep(10)
+      wait_for_backpressure(server, expected_raw_bytes, attempts - 1)
+    end
+  end
+
+  defp wait_for_pending_http_call(server, attempts \\ 100)
+
+  defp wait_for_pending_http_call(_server, 0) do
+    flunk("StreamServer did not retain the pending HTTP call")
+  end
+
+  defp wait_for_pending_http_call(server, attempts) do
+    state = :sys.get_state(server)
+
+    if :queue.len(state.pending_http_calls) == 1 do
+      :ok
+    else
+      Process.sleep(10)
+      wait_for_pending_http_call(server, attempts - 1)
+    end
+  end
+
+  defp wait_for_telemetry_backpressure(server, attempts \\ 100)
+
+  defp wait_for_telemetry_backpressure(_server, 0) do
+    flunk("StreamServer did not backpressure deferred telemetry events")
+  end
+
+  defp wait_for_telemetry_backpressure(server, attempts) do
+    state = :sys.get_state(server)
+
+    if state.blocked_http_event && length(state.pending_http_events) == 1 do
+      :ok
+    else
+      Process.sleep(10)
+      wait_for_telemetry_backpressure(server, attempts - 1)
     end
   end
 end
