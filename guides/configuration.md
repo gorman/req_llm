@@ -439,7 +439,7 @@ end
 
 ### `on_finch_request` (per-request)
 
-Pass an anonymous function `(Finch.Request.t() -> Finch.Request.t())` as a per-call option:
+Pass an anonymous function `(Finch.Request.t() -> Finch.Request.t() | {:error, term()})` as a per-call option:
 
 ```elixir
 ReqLLM.stream_text("openai:gpt-4o", "Hello",
@@ -449,9 +449,19 @@ ReqLLM.stream_text("openai:gpt-4o", "Hello",
 )
 ```
 
+### Refusing a request
+
+Either hook can return `{:error, reason}` instead of a request. ReqLLM then does not send the request, and the caller gets `{:error, {:provider_build_failed, reason}}`. This is the only place that sees the fully encoded body, so it is where a size or content guard belongs:
+
+```elixir
+on_finch_request: fn req ->
+  if byte_size(req.body) > 1_000_000, do: {:error, :prompt_too_large}, else: req
+end
+```
+
 ### Precedence
 
-Both mechanisms can be combined. The config-level adapter is applied first, then the per-request callback. Each step receives the output of the previous one.
+Both mechanisms can be combined. The config-level adapter is applied first, then the per-request callback. Each step receives the output of the previous one. If the config-level adapter refuses the request, the per-request callback does not run.
 
 ## Telemetry Configuration
 

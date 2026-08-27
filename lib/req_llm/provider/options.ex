@@ -228,7 +228,7 @@ defmodule ReqLLM.Provider.Options do
                                on_finch_request: [
                                  type: {:fun, 1},
                                  doc:
-                                   "Callback `(Finch.Request.t() -> Finch.Request.t())` applied to the streaming request just before it is sent. Applied after the global `finch_request_adapter` config. See `ReqLLM.FinchRequestAdapter` for the config-level equivalent."
+                                   "Callback `(Finch.Request.t() -> Finch.Request.t() | {:error, term()})` applied to the streaming request just before it is sent. Returning `{:error, reason}` stops the request instead of sending it. Applied after the global `finch_request_adapter` config. See `ReqLLM.FinchRequestAdapter` for the config-level equivalent."
                                ],
 
                                # Framework options

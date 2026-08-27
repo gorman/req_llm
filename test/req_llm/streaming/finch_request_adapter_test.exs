@@ -23,6 +23,13 @@ defmodule ReqLLM.Streaming.FinchRequestAdapterTest do
     end
   end
 
+  defmodule RefusingAdapter do
+    @behaviour ReqLLM.FinchRequestAdapter
+
+    @impl true
+    def call(%Finch.Request{}), do: {:error, {:prompt_too_large, 1_019_044}}
+  end
+
   setup do
     adapter_config = Application.get_env(:req_llm, :finch_request_adapter)
     on_exit(fn -> Application.put_env(:req_llm, :finch_request_adapter, adapter_config) end)
@@ -74,6 +81,36 @@ defmodule ReqLLM.Streaming.FinchRequestAdapterTest do
 
       assert {:ok, _task, _http_context, _json} = build_stream(on_finch_request: callback)
       assert_receive {:received, %Finch.Request{}}
+    end
+  end
+
+  describe "an adapter that refuses the request" do
+    test "the reason reaches the caller instead of the request being sent" do
+      Application.put_env(:req_llm, :finch_request_adapter, RefusingAdapter)
+
+      assert {:error, {:provider_build_failed, {:prompt_too_large, 1_019_044}}} =
+               build_stream()
+    end
+
+    test "a refusing per-request callback stops the request too" do
+      callback = fn %Finch.Request{} -> {:error, :nope} end
+
+      assert {:error, {:provider_build_failed, :nope}} =
+               build_stream(on_finch_request: callback)
+    end
+
+    test "a config adapter that refuses skips the per-request callback" do
+      Application.put_env(:req_llm, :finch_request_adapter, RefusingAdapter)
+      test_pid = self()
+
+      callback = fn req ->
+        send(test_pid, :callback_ran)
+        req
+      end
+
+      assert {:error, {:provider_build_failed, {:prompt_too_large, _}}} =
+               build_stream(on_finch_request: callback)
+      refute_receive :callback_ran
     end
   end
 
