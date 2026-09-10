@@ -94,7 +94,8 @@ defmodule ReqLLM.Provider.DefaultsTest do
       merged = Defaults.merge_finch_options(request_options, pool_timeout: 30_000)
 
       if @nested_finch_options do
-        assert merged[:finch] == [pool_timeout: 30_000, name: MyApp.CustomFinch]
+        assert merged[:finch][:pool_timeout] == 30_000
+        assert merged[:finch][:name] == MyApp.CustomFinch
       else
         assert merged[:finch] == MyApp.CustomFinch
         assert merged[:pool_timeout] == 30_000

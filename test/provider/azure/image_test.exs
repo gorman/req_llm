@@ -13,6 +13,8 @@ defmodule ReqLLM.Providers.Azure.ImageTest do
 
   use ExUnit.Case, async: true
 
+  @nested_finch_options Version.match?(to_string(Application.spec(:req, :vsn)), ">= 0.7.0")
+
   @moduletag :capture_log
 
   alias ReqLLM.Providers.Azure
@@ -158,7 +160,11 @@ defmodule ReqLLM.Providers.Azure.ImageTest do
     test "sets a Finch pool_timeout matching the long image receive_timeout" do
       request = prepare!(base_url: @traditional_base_url)
 
-      assert (request.options[:pool_timeout] || request.options[:finch][:pool_timeout]) == 120_000
+      if @nested_finch_options do
+        assert request.options[:finch][:pool_timeout] == 120_000
+      else
+        assert request.options[:pool_timeout] == 120_000
+      end
     end
 
     test "resolves aspect_ratio to the nearest size the model offers" do
