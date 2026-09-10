@@ -1,6 +1,8 @@
 defmodule ReqLLM.Providers.AmazonBedrockTest do
   use ExUnit.Case, async: true
 
+  @nested_finch_options Version.match?(to_string(Application.spec(:req, :vsn)), ">= 0.7.0")
+
   alias ReqLLM.{Context, Providers.AmazonBedrock}
 
   describe "provider basics" do
@@ -479,7 +481,11 @@ defmodule ReqLLM.Providers.AmazonBedrockTest do
 
       {:ok, request} = AmazonBedrock.prepare_request(:chat, model, context, opts)
 
-      assert request.options[:finch] == [name: ReqLLM.Application.finch_name()]
+      if @nested_finch_options do
+        assert request.options[:finch] == [name: ReqLLM.Application.finch_name()]
+      else
+        assert request.options[:finch] == ReqLLM.Application.finch_name()
+      end
     end
   end
 
@@ -712,7 +718,11 @@ defmodule ReqLLM.Providers.AmazonBedrockTest do
 
       attached = AmazonBedrock.attach_embedding(request, model, opts)
 
-      assert attached.options[:finch] == [name: ReqLLM.Application.finch_name()]
+      if @nested_finch_options do
+        assert attached.options[:finch] == [name: ReqLLM.Application.finch_name()]
+      else
+        assert attached.options[:finch] == ReqLLM.Application.finch_name()
+      end
     end
 
     test "sets content-type header", %{model: model, opts: opts} do

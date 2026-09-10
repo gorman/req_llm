@@ -594,22 +594,37 @@ defmodule ReqLLM.Provider.Defaults do
   @spec merge_finch_options(keyword(), keyword()) :: keyword()
   def merge_finch_options(request_options, defaults \\ []) do
     {finch, request_options} = Keyword.pop(request_options, :finch)
-    finch_options = Keyword.merge(defaults, normalize_finch_options(finch))
 
-    Keyword.put(request_options, :finch, finch_options)
+    defaults
+    |> Keyword.merge(normalize_finch_options(finch))
+    |> format_finch_options()
+    |> Keyword.merge(request_options)
   end
 
   @spec finch_option(Req.Request.t(), keyword()) :: keyword()
   def finch_option(%Req.Request{} = request, options \\ []) do
-    current_options =
-      normalize_finch_options(request.options[:finch])
-
-    [finch: Keyword.merge(current_options, options)]
+    request.options[:finch]
+    |> normalize_finch_options()
+    |> Keyword.merge(options)
+    |> format_finch_options()
   end
 
   defp normalize_finch_options(nil), do: [name: ReqLLM.Application.finch_name()]
   defp normalize_finch_options(name) when is_atom(name), do: [name: name]
   defp normalize_finch_options(options) when is_list(options), do: options
+
+  # Req 0.7 introduced nested Finch options. Older versions read the pool
+  # name from :finch and the timeouts from the top-level request options.
+  defp format_finch_options(finch_options) do
+    if Version.match?(to_string(Application.spec(:req, :vsn)), ">= 0.7.0") do
+      [finch: finch_options]
+    else
+      {name, pool_options} =
+        Keyword.pop_lazy(finch_options, :name, &ReqLLM.Application.finch_name/0)
+
+      [finch: name] ++ pool_options
+    end
+  end
 
   @doc """
   Fetches API key and extra common option keys.

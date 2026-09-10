@@ -1,6 +1,8 @@
 defmodule ReqLLM.Step.RetryTest do
   use ExUnit.Case, async: true
 
+  @nested_finch_options Version.match?(to_string(Application.spec(:req, :vsn)), ">= 0.7.0")
+
   alias ReqLLM.Step.Retry
 
   describe "attach/1" do
@@ -248,7 +250,11 @@ defmodule ReqLLM.Step.RetryTest do
           api_key: "test-key"
         )
 
-      assert request.options[:finch] == [name: :custom_finch]
+      if @nested_finch_options do
+        assert request.options[:finch] == [name: :custom_finch]
+      else
+        assert request.options[:finch] == :custom_finch
+      end
     end
 
     test "default_attach preserves caller max_retries" do

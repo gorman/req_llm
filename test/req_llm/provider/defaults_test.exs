@@ -9,62 +9,142 @@ defmodule ReqLLM.Provider.DefaultsTest do
   alias ReqLLM.Provider.Defaults.ResponseBuilder
   alias ReqLLM.StreamChunk
 
+  @nested_finch_options Version.match?(to_string(Application.spec(:req, :vsn)), ">= 0.7.0")
+
   describe "Finch options" do
-    test "builds current Req options for the application pool and timeout" do
+    @tag skip: not @nested_finch_options
+    test "preserves tagged pools through the Req adapter" do
+      options =
+        Defaults.merge_finch_options(
+          [finch: [name: MyApp.CustomFinch, pool_tag: :bulk]],
+          pool_timeout: 30_000
+        )
+
+      request =
+        Req.new(options ++ [url: "https://example.invalid"])
+        |> Req.Request.merge_options(
+          finch_request: fn req, finch_request, name, finch_options ->
+            assert name == MyApp.CustomFinch
+            assert finch_request.pool_tag == :bulk
+            assert finch_options[:pool_timeout] == 30_000
+            {req, Req.Response.new(status: 200)}
+          end
+        )
+
+      ExUnit.CaptureIO.capture_io(:stderr, fn ->
+        assert {_, %Req.Response{status: 200}} = Req.Finch.run(request)
+      end)
+    end
+
+    @tag skip: not @nested_finch_options
+    test "preserves dynamic pool options without adding a pool name" do
+      options =
+        Defaults.merge_finch_options(
+          [finch: [conn_max_idle_time: 10_000]],
+          pool_timeout: 30_000
+        )
+
+      request = Req.new(options)
+
+      refute Keyword.has_key?(request.options[:finch], :name)
+      assert request.options[:finch][:conn_max_idle_time] == 10_000
+      assert request.options[:finch][:pool_timeout] == 30_000
+    end
+
+    test "passes the pool name and timeouts to the Req adapter" do
+      options =
+        Defaults.merge_finch_options(
+          [finch: MyApp.CustomFinch, receive_timeout: 60_000],
+          pool_timeout: 30_000
+        )
+
+      request = Req.new(options ++ [url: "https://example.invalid"])
+
+      request =
+        request
+        |> Req.Request.merge_options(Defaults.finch_option(request))
+        |> Req.Request.merge_options(
+          finch_request: fn req, _finch_request, name, finch_options ->
+            assert name == MyApp.CustomFinch
+            assert finch_options[:pool_timeout] == 30_000
+            assert finch_options[:receive_timeout] == 60_000
+            {req, Req.Response.new(status: 200)}
+          end
+        )
+
+      ExUnit.CaptureIO.capture_io(:stderr, fn ->
+        assert {_, %Req.Response{status: 200}} = Req.Finch.run(request)
+      end)
+    end
+
+    test "builds Req options for the application pool and timeout" do
       merged = Defaults.merge_finch_options([], pool_timeout: 30_000)
 
-      assert merged[:finch][:name] == ReqLLM.Application.finch_name()
-      assert merged[:finch][:pool_timeout] == 30_000
+      if @nested_finch_options do
+        assert merged[:finch][:name] == ReqLLM.Application.finch_name()
+        assert merged[:finch][:pool_timeout] == 30_000
+      else
+        assert merged[:finch] == ReqLLM.Application.finch_name()
+        assert merged[:pool_timeout] == 30_000
+      end
     end
 
     test "merges caller Finch options with request defaults" do
-      request_options = [finch: [name: MyApp.CustomFinch, pool_tag: :bulk], retry: false]
-
+      request_options = [finch: [name: MyApp.CustomFinch], retry: false]
       merged = Defaults.merge_finch_options(request_options, pool_timeout: 30_000)
 
-      assert merged[:finch][:name] == MyApp.CustomFinch
-      assert merged[:finch][:pool_tag] == :bulk
-      assert merged[:finch][:pool_timeout] == 30_000
+      if @nested_finch_options do
+        assert merged[:finch][:pool_timeout] == 30_000
+        assert merged[:finch][:name] == MyApp.CustomFinch
+      else
+        assert merged[:finch] == MyApp.CustomFinch
+        assert merged[:pool_timeout] == 30_000
+      end
+
       assert merged[:retry] == false
     end
 
     test "lets caller Finch options override request defaults" do
       request_options = [finch: [name: MyApp.CustomFinch, pool_timeout: 60_000]]
-
       merged = Defaults.merge_finch_options(request_options, pool_timeout: 30_000)
 
-      assert merged[:finch][:pool_timeout] == 60_000
+      if @nested_finch_options do
+        assert merged[:finch][:pool_timeout] == 60_000
+      else
+        assert merged[:pool_timeout] == 60_000
+      end
     end
 
-    test "does not add a pool name to dynamic Finch pool options" do
-      request_options = [finch: [conn_max_idle_time: 10_000]]
+    @tag skip: @nested_finch_options
+    test "falls back to the application pool on older Req versions" do
+      merged = Defaults.merge_finch_options([finch: [pool_timeout: 60_000]], pool_timeout: 30_000)
 
-      merged = Defaults.merge_finch_options(request_options, pool_timeout: 30_000)
-
-      refute Keyword.has_key?(merged[:finch], :name)
-      assert merged[:finch][:conn_max_idle_time] == 10_000
-      assert merged[:finch][:pool_timeout] == 30_000
+      assert merged[:finch] == ReqLLM.Application.finch_name()
+      assert merged[:pool_timeout] == 60_000
     end
 
     test "normalizes a legacy pool name" do
       request = Req.new() |> Req.Request.merge_options(finch: MyApp.CustomFinch)
 
-      assert Defaults.finch_option(request) == [finch: [name: MyApp.CustomFinch]]
+      if @nested_finch_options do
+        assert Defaults.finch_option(request) == [finch: [name: MyApp.CustomFinch]]
+      else
+        assert Defaults.finch_option(request) == [finch: MyApp.CustomFinch]
+      end
     end
 
-    test "preserves current Finch options and merges overrides" do
+    test "preserves the pool name and merges overrides" do
       request =
         Req.new()
-        |> Req.Request.merge_options(finch: [name: MyApp.CustomFinch, pool_tag: :bulk])
+        |> Req.Request.merge_options(finch: [name: MyApp.CustomFinch])
 
-      assert Defaults.finch_option(request, pool_timeout: 30_000) ==
-               [
-                 finch: [
-                   name: MyApp.CustomFinch,
-                   pool_tag: :bulk,
-                   pool_timeout: 30_000
-                 ]
-               ]
+      if @nested_finch_options do
+        assert Defaults.finch_option(request, pool_timeout: 30_000) ==
+                 [finch: [name: MyApp.CustomFinch, pool_timeout: 30_000]]
+      else
+        assert Defaults.finch_option(request, pool_timeout: 30_000) ==
+                 [finch: MyApp.CustomFinch, pool_timeout: 30_000]
+      end
     end
   end
 

@@ -15,6 +15,8 @@ defmodule ReqLLM.Providers.AzureTest do
 
   use ExUnit.Case, async: true
 
+  @nested_finch_options Version.match?(to_string(Application.spec(:req, :vsn)), ">= 0.7.0")
+
   alias ReqLLM.Providers.Azure
 
   describe "model lookup" do
@@ -91,7 +93,11 @@ defmodule ReqLLM.Providers.AzureTest do
           req_http_options: [finch: :custom_finch]
         )
 
-      assert request.options[:finch] == [name: :custom_finch]
+      if @nested_finch_options do
+        assert request.options[:finch] == [name: :custom_finch]
+      else
+        assert request.options[:finch] == :custom_finch
+      end
     end
 
     test "embedding operation uses correct endpoint" do
