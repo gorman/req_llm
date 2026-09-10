@@ -9,22 +9,25 @@ defmodule ReqLLM.Provider.DefaultsTest do
   alias ReqLLM.Provider.Defaults.ResponseBuilder
   alias ReqLLM.StreamChunk
 
+  # Req takes the pool name under `:finch` and the rest of the Finch settings
+  # beside it. Upstream moved these into a nested keyword list for Req 0.7;
+  # Opal pins Req 0.6.x, where that shape reaches Finch as a registry name and
+  # crashes in `Registry.lookup/2`.
   describe "Finch options" do
-    test "builds current Req options for the application pool and timeout" do
+    test "builds Req options for the application pool and timeout" do
       merged = Defaults.merge_finch_options([], pool_timeout: 30_000)
 
-      assert merged[:finch][:name] == ReqLLM.Application.finch_name()
-      assert merged[:finch][:pool_timeout] == 30_000
+      assert merged[:finch] == ReqLLM.Application.finch_name()
+      assert merged[:pool_timeout] == 30_000
     end
 
     test "merges caller Finch options with request defaults" do
-      request_options = [finch: [name: MyApp.CustomFinch, pool_tag: :bulk], retry: false]
+      request_options = [finch: [name: MyApp.CustomFinch], retry: false]
 
       merged = Defaults.merge_finch_options(request_options, pool_timeout: 30_000)
 
-      assert merged[:finch][:name] == MyApp.CustomFinch
-      assert merged[:finch][:pool_tag] == :bulk
-      assert merged[:finch][:pool_timeout] == 30_000
+      assert merged[:finch] == MyApp.CustomFinch
+      assert merged[:pool_timeout] == 30_000
       assert merged[:retry] == false
     end
 
@@ -33,38 +36,29 @@ defmodule ReqLLM.Provider.DefaultsTest do
 
       merged = Defaults.merge_finch_options(request_options, pool_timeout: 30_000)
 
-      assert merged[:finch][:pool_timeout] == 60_000
+      assert merged[:pool_timeout] == 60_000
     end
 
-    test "does not add a pool name to dynamic Finch pool options" do
-      request_options = [finch: [conn_max_idle_time: 10_000]]
+    test "falls back to the application pool when the caller names none" do
+      merged = Defaults.merge_finch_options([finch: [pool_timeout: 60_000]], pool_timeout: 30_000)
 
-      merged = Defaults.merge_finch_options(request_options, pool_timeout: 30_000)
-
-      refute Keyword.has_key?(merged[:finch], :name)
-      assert merged[:finch][:conn_max_idle_time] == 10_000
-      assert merged[:finch][:pool_timeout] == 30_000
+      assert merged[:finch] == ReqLLM.Application.finch_name()
+      assert merged[:pool_timeout] == 60_000
     end
 
     test "normalizes a legacy pool name" do
       request = Req.new() |> Req.Request.merge_options(finch: MyApp.CustomFinch)
 
-      assert Defaults.finch_option(request) == [finch: [name: MyApp.CustomFinch]]
+      assert Defaults.finch_option(request) == [finch: MyApp.CustomFinch]
     end
 
-    test "preserves current Finch options and merges overrides" do
+    test "preserves the pool name and merges overrides beside it" do
       request =
         Req.new()
-        |> Req.Request.merge_options(finch: [name: MyApp.CustomFinch, pool_tag: :bulk])
+        |> Req.Request.merge_options(finch: [name: MyApp.CustomFinch])
 
       assert Defaults.finch_option(request, pool_timeout: 30_000) ==
-               [
-                 finch: [
-                   name: MyApp.CustomFinch,
-                   pool_tag: :bulk,
-                   pool_timeout: 30_000
-                 ]
-               ]
+               [finch: MyApp.CustomFinch, pool_timeout: 30_000]
     end
   end
 
