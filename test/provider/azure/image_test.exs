@@ -158,7 +158,7 @@ defmodule ReqLLM.Providers.Azure.ImageTest do
     test "sets a Finch pool_timeout matching the long image receive_timeout" do
       request = prepare!(base_url: @traditional_base_url)
 
-      assert request.options[:finch][:pool_timeout] == 120_000
+      assert (request.options[:pool_timeout] || request.options[:finch][:pool_timeout]) == 120_000
     end
 
     test "resolves aspect_ratio to the nearest size the model offers" do

@@ -597,7 +597,7 @@ defmodule ReqLLM.Provider.Defaults do
 
     defaults
     |> Keyword.merge(normalize_finch_options(finch))
-    |> split_finch_options()
+    |> format_finch_options()
     |> Keyword.merge(request_options)
   end
 
@@ -606,27 +606,24 @@ defmodule ReqLLM.Provider.Defaults do
     request.options[:finch]
     |> normalize_finch_options()
     |> Keyword.merge(options)
-    |> split_finch_options()
+    |> format_finch_options()
   end
 
   defp normalize_finch_options(nil), do: [name: ReqLLM.Application.finch_name()]
   defp normalize_finch_options(name) when is_atom(name), do: [name: name]
   defp normalize_finch_options(options) when is_list(options), do: options
 
-  # Req takes the pool name under `:finch` and every other Finch setting
-  # alongside it, not nested inside it: `Req.Finch` passes `options[:finch]`
-  # straight to Finch as the instance name, and reads `:pool_timeout` and
-  # `:receive_timeout` from the top level of the request options.
-  #
-  # Nesting them instead hands Finch a keyword list where it expects a registry
-  # name, and it fails deep in `Registry.lookup/2` rather than anywhere that
-  # names the option. Only the non-streaming path reaches this: streaming
-  # resolves its own `:finch_name` and calls Finch directly.
-  defp split_finch_options(finch_options) do
-    {name, pool_options} =
-      Keyword.pop_lazy(finch_options, :name, &ReqLLM.Application.finch_name/0)
+  # Req 0.7 introduced nested Finch options. Older versions read the pool
+  # name from :finch and the timeouts from the top-level request options.
+  defp format_finch_options(finch_options) do
+    if Version.match?(to_string(Application.spec(:req, :vsn)), ">= 0.7.0") do
+      [finch: finch_options]
+    else
+      {name, pool_options} =
+        Keyword.pop_lazy(finch_options, :name, &ReqLLM.Application.finch_name/0)
 
-    [finch: name] ++ pool_options
+      [finch: name] ++ pool_options
+    end
   end
 
   @doc """

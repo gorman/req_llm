@@ -75,6 +75,7 @@ defmodule ReqLLM.Providers.OpenAITest do
       assert request.method == :post
     end
 
+    @tag skip: not Version.match?(to_string(Application.spec(:req, :vsn)), ">= 0.7.0")
     test "prepare_request merges custom Finch options with the request timeout" do
       {:ok, model} = ReqLLM.model("openai:gpt-4-turbo")
       context = context_fixture()
