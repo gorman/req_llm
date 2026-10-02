@@ -114,6 +114,13 @@ defmodule ReqLLM.Provider.Defaults.ResponseBuilder do
         stop_reason -> Map.put_new(provider_meta, "stop_reason", stop_reason)
       end
 
+    # A refusal's category, kept where the non-streaming decoder keeps it.
+    provider_meta =
+      case ChunkAccumulator.finalize_stop_details(acc) do
+        nil -> provider_meta
+        stop_details -> Map.put_new(provider_meta, "stop_details", stop_details)
+      end
+
     # The code-execution container survives alongside stop_reason: resuming a
     # "pause_turn" with pending code-execution tool uses requires sending the
     # container id back on the follow-up request.

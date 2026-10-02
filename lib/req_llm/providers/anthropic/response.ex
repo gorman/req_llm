@@ -716,7 +716,9 @@ defmodule ReqLLM.Providers.Anthropic.Response do
       })
     ]
 
-    chunks = container_chunks(delta) ++ context_management_chunks(data) ++ chunks
+    chunks =
+      container_chunks(delta) ++
+        context_management_chunks(data) ++ stop_details_chunks(delta) ++ chunks
 
     if raw_usage == %{} do
       chunks
@@ -725,6 +727,15 @@ defmodule ReqLLM.Providers.Anthropic.Response do
       [usage_chunk | chunks]
     end
   end
+
+  # Why the model declined (its category) when stop_reason is "refusal". A
+  # non-streaming response keeps it in provider_meta; on a stream it rides the
+  # closing message_delta. The API sends null for every other stop.
+  defp stop_details_chunks(%{"stop_details" => %{} = details}) do
+    [ReqLLM.StreamChunk.meta(%{stop_details: details})]
+  end
+
+  defp stop_details_chunks(_), do: []
 
   defp start_thinking_block(state, index, block) do
     text = extract_thinking_text(block)

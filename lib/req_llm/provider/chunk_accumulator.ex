@@ -93,6 +93,7 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
           annotations: [term()],
           finish_reason: atom() | String.t() | nil,
           stop_reason: String.t() | nil,
+          stop_details: map() | nil,
           usage: map() | nil,
           container: map() | nil,
           completed_tool_indexes: MapSet.t(),
@@ -110,6 +111,7 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
             annotations: [],
             finish_reason: nil,
             stop_reason: nil,
+            stop_details: nil,
             usage: nil,
             container: nil,
             completed_tool_indexes: MapSet.new(),
@@ -197,6 +199,7 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
     |> push_annotations(metadata)
     |> push_finish_reason(metadata)
     |> push_stop_reason(metadata)
+    |> push_stop_details(metadata)
     |> push_usage(metadata)
     |> push_container(metadata)
     |> push_tool_call_complete(metadata)
@@ -277,6 +280,13 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
   end
 
   defp push_stop_reason(acc, _metadata), do: acc
+
+  # Why the provider stopped, when it says (e.g. Anthropic's refusal category).
+  defp push_stop_details(acc, %{stop_details: details}) when is_map(details) do
+    %{acc | stop_details: details}
+  end
+
+  defp push_stop_details(acc, _metadata), do: acc
 
   # Usage is merged via `ReqLLM.Usage.merge/2` — handles cumulative
   # streaming token counters (latest-max wins per field) plus recomputed
@@ -440,6 +450,13 @@ defmodule ReqLLM.Provider.ChunkAccumulator do
   """
   @spec finalize_stop_reason(t()) :: String.t() | nil
   def finalize_stop_reason(%__MODULE__{stop_reason: reason}), do: reason
+
+  @doc """
+  Returns the provider's stop details from meta chunks, or `nil`. Anthropic
+  sends them with a refusal; they name the category the model declined in.
+  """
+  @spec finalize_stop_details(t()) :: map() | nil
+  def finalize_stop_details(%__MODULE__{stop_details: details}), do: details
 
   @doc """
   Returns the provider's code-execution sandbox descriptor (e.g. Anthropic's

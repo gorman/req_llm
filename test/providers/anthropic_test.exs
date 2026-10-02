@@ -1567,6 +1567,85 @@ defmodule ReqLLM.Providers.AnthropicTest do
       assert tool_call.function.arguments == "{}"
       refute get_in(tool_call.function, [:metadata, :error])
     end
+
+    # A non-streaming refusal keeps stop_details in provider_meta. A streamed
+    # refusal must keep it the same way, or a caller cannot tell the category.
+    test "a streamed refusal keeps stop_details in the built response's provider_meta" do
+      {:ok, model} = ReqLLM.model("anthropic:claude-sonnet-4-5-20250929")
+      stop_details = %{"type" => "refusal", "category" => "general_harms", "explanation" => nil}
+
+      events = [
+        %{
+          data: %{
+            "type" => "content_block_start",
+            "index" => 0,
+            "content_block" => %{"type" => "text", "text" => ""}
+          }
+        },
+        %{
+          data: %{
+            "type" => "content_block_delta",
+            "index" => 0,
+            "delta" => %{"type" => "text_delta", "text" => "Here is"}
+          }
+        },
+        %{data: %{"type" => "content_block_stop", "index" => 0}},
+        %{
+          data: %{
+            "type" => "message_delta",
+            "delta" => %{
+              "stop_reason" => "refusal",
+              "stop_sequence" => nil,
+              "stop_details" => stop_details
+            },
+            "usage" => %{"output_tokens" => 3}
+          }
+        }
+      ]
+
+      {chunks, _state} =
+        Enum.reduce(events, {[], Anthropic.init_stream_state(model)}, fn event, {acc, state} ->
+          {event_chunks, next_state} = Anthropic.decode_stream_event(event, model, state)
+          {acc ++ event_chunks, next_state}
+        end)
+
+      {:ok, response} =
+        ReqLLM.Providers.Anthropic.ResponseBuilder.build_response(
+          chunks,
+          %{finish_reason: :content_filter},
+          context: %ReqLLM.Context{messages: []},
+          model: model
+        )
+
+      assert response.finish_reason == :content_filter
+      assert response.provider_meta["stop_reason"] == "refusal"
+      assert response.provider_meta["stop_details"] == stop_details
+    end
+
+    test "a streamed stop with null stop_details adds no stop_details to provider_meta" do
+      {:ok, model} = ReqLLM.model("anthropic:claude-sonnet-4-5-20250929")
+
+      event = %{
+        data: %{
+          "type" => "message_delta",
+          "delta" => %{"stop_reason" => "end_turn", "stop_details" => nil},
+          "usage" => %{"output_tokens" => 1}
+        }
+      }
+
+      {chunks, _state} =
+        Anthropic.decode_stream_event(event, model, Anthropic.init_stream_state(model))
+
+      {:ok, response} =
+        ReqLLM.Providers.Anthropic.ResponseBuilder.build_response(
+          [ReqLLM.StreamChunk.text("ok") | chunks],
+          %{finish_reason: :stop},
+          context: %ReqLLM.Context{messages: []},
+          model: model
+        )
+
+      refute Map.has_key?(response.provider_meta, "stop_details")
+    end
   end
 
   describe "option translation" do
