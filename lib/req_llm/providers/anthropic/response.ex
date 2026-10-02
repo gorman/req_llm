@@ -198,7 +198,10 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   def flush_stream_state(_model, state) do
     state = ensure_stream_state(state)
     {details, state} = drain_thinking_blocks(state)
-    {reasoning_detail_chunks(details) ++ drained_provider_blocks(details), state}
+    {text_blocks, state} = drain_text_blocks(state)
+
+    {reasoning_detail_chunks(details) ++
+       drained_provider_blocks(details) ++ Enum.map(text_blocks, &text_block_chunk/1), state}
   end
 
   # Private helper functions
@@ -216,16 +219,24 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     [ReqLLM.StreamChunk.text(content)]
   end
 
-  defp decode_content_block(%{"type" => "text", "text" => text}) do
-    ReqLLM.StreamChunk.text(text)
+  defp decode_content_block(%{"type" => "text", "text" => text} = block) do
+    [ReqLLM.StreamChunk.text(text), text_part_chunk(text, Map.get(block, "citations"))]
   end
 
-  defp decode_content_block(%{"type" => "thinking", "thinking" => text} = block) do
-    ReqLLM.StreamChunk.thinking(text, thinking_metadata(block))
-  end
+  # A signed block is also emitted positionally, as the stream decoder does at
+  # content_block_stop, so it can be replayed in place. An unsigned one cannot be
+  # replayed at all.
+  defp decode_content_block(%{"type" => "thinking"} = block) do
+    text = extract_thinking_text(block)
+    thinking = ReqLLM.StreamChunk.thinking(text, thinking_metadata(block))
 
-  defp decode_content_block(%{"type" => "thinking", "text" => text} = block) do
-    ReqLLM.StreamChunk.thinking(text, thinking_metadata(block))
+    case normalize_signature(Map.get(block, "signature")) do
+      nil ->
+        thinking
+
+      signature ->
+        [thinking, server_block_chunk(raw_thinking_block(%{text: text, signature: signature}))]
+    end
   end
 
   defp decode_content_block(%{"type" => "tool_use", "id" => id, "name" => name, "input" => input}) do
@@ -236,6 +247,12 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   # so they can be re-sent on the next request — required for pause_turn
   # continuations and for multi-turn reuse of results (encrypted_content).
   defp decode_content_block(%{"type" => type} = block) when type in @server_tool_block_types do
+    server_block_chunk(block)
+  end
+
+  # redacted_thinking and block types this module does not know yet are kept
+  # verbatim: leaving one out of the replay is a gap in the signed prefix.
+  defp decode_content_block(%{"type" => type} = block) when is_binary(type) do
     server_block_chunk(block)
   end
 
@@ -266,6 +283,20 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   end
 
   defp decode_content_block_delta(_, _index), do: []
+
+  defp decode_content_block_delta(%{"type" => "text_delta", "text" => text} = delta, index, state)
+       when is_binary(text) do
+    {decode_content_block_delta(delta, index), append_text_block(state, index, text)}
+  end
+
+  defp decode_content_block_delta(
+         %{"type" => "citations_delta", "citation" => citation},
+         index,
+         state
+       )
+       when is_map(citation) do
+    {[], append_text_block_citation(state, index, citation)}
+  end
 
   defp decode_content_block_delta(%{"type" => "thinking_delta", "thinking" => text}, index, state)
        when is_binary(text) do
@@ -361,6 +392,18 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   # stream never closed means the args were cut off in transport.
   defp decode_content_block_start(%{"type" => "tool_use"} = block, index, state) do
     {decode_content_block_start(block, index), track_tool_block(state, index)}
+  end
+
+  defp decode_content_block_start(%{"type" => "text"} = block, index, state) do
+    {decode_content_block_start(block, index), start_text_block(state, index, block)}
+  end
+
+  # redacted_thinking, and any block type this module does not know yet, is
+  # held until its content_block_stop and then re-sent verbatim. Dropping one
+  # leaves a gap in the content a later thinking signature covers.
+  defp decode_content_block_start(%{"type" => type} = block, index, state)
+       when is_binary(type) do
+    {[], put_opaque_block(state, index, block)}
   end
 
   defp decode_content_block_start(block, index, state) do
@@ -464,13 +507,93 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   end
 
   # A content_block_stop closes whichever kind of stateful block is pending at
-  # that index: a buffered server_tool_use emits its completed block; anything
-  # else falls through to thinking finalization.
+  # that index: a buffered server_tool_use, opaque block or text block emits its
+  # completed block; anything else falls through to tool or thinking
+  # finalization.
   defp finalize_content_block(index, state) do
-    case pop_server_block(state, index) do
-      {nil, state} -> finalize_tool_or_thinking_block(index, state)
+    with {nil, state} <- pop_server_block(state, index),
+         {nil, state} <- pop_opaque_block(state, index),
+         {nil, state} <- pop_text_block(state, index) do
+      finalize_tool_or_thinking_block(index, state)
+    else
+      {%{"type" => "text"} = block, state} -> {[text_block_chunk(block)], state}
       {block, state} -> {[server_block_chunk(block)], state}
     end
+  end
+
+  defp start_text_block(state, index, block) do
+    entry = %{
+      text: [Map.get(block, "text", "")],
+      citations: Enum.reverse(List.wrap(Map.get(block, "citations")))
+    }
+
+    Map.put(state, :text_blocks, Map.put(Map.get(state, :text_blocks, %{}), index, entry))
+  end
+
+  defp append_text_block(state, index, text) do
+    update_text_block(state, index, &%{&1 | text: [&1.text, text]})
+  end
+
+  defp append_text_block_citation(state, index, citation) do
+    update_text_block(state, index, &%{&1 | citations: [citation | &1.citations]})
+  end
+
+  defp update_text_block(state, index, fun) do
+    blocks = Map.get(state, :text_blocks, %{})
+
+    case blocks do
+      %{^index => entry} -> Map.put(state, :text_blocks, Map.put(blocks, index, fun.(entry)))
+      _ -> state
+    end
+  end
+
+  defp pop_text_block(state, index) do
+    case Map.pop(Map.get(state, :text_blocks, %{}), index) do
+      {nil, _} -> {nil, state}
+      {entry, rest} -> {completed_text_block(entry), Map.put(state, :text_blocks, rest)}
+    end
+  end
+
+  defp drain_text_blocks(state) do
+    blocks =
+      state
+      |> Map.get(:text_blocks, %{})
+      |> Enum.sort_by(fn {index, _entry} -> index end)
+      |> Enum.map(fn {_index, entry} -> completed_text_block(entry) end)
+
+    {blocks, Map.put(state, :text_blocks, %{})}
+  end
+
+  defp completed_text_block(%{text: text, citations: citations}) do
+    %{
+      "type" => "text",
+      "text" => IO.iodata_to_binary(text),
+      "citations" => Enum.reverse(citations)
+    }
+  end
+
+  defp text_block_chunk(%{"text" => text, "citations" => citations}),
+    do: text_part_chunk(text, citations)
+
+  # Marks where a text block ended, so the response builder can keep each text
+  # block separate and in place instead of joining every text run into one.
+  defp text_part_chunk(text, citations) do
+    part =
+      case citations do
+        [_ | _] -> ReqLLM.Message.ContentPart.text(text, %{citations: citations})
+        _ -> ReqLLM.Message.ContentPart.text(text)
+      end
+
+    ReqLLM.StreamChunk.meta(%{anthropic_text_part: part})
+  end
+
+  defp put_opaque_block(state, index, block) do
+    Map.put(state, :opaque_blocks, Map.put(Map.get(state, :opaque_blocks, %{}), index, block))
+  end
+
+  defp pop_opaque_block(state, index) do
+    {block, rest} = Map.pop(Map.get(state, :opaque_blocks, %{}), index)
+    {block, Map.put(state, :opaque_blocks, rest)}
   end
 
   defp finalize_tool_or_thinking_block(index, state) do

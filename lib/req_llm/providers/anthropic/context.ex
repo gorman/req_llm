@@ -254,8 +254,13 @@ defmodule ReqLLM.Providers.Anthropic.Context do
 
   defp do_encode_content_part(%ReqLLM.Message.ContentPart{type: :text, text: ""}), do: nil
 
-  defp do_encode_content_part(%ReqLLM.Message.ContentPart{type: :text, text: text}) do
+  defp do_encode_content_part(%ReqLLM.Message.ContentPart{
+         type: :text,
+         text: text,
+         metadata: metadata
+       }) do
     %{type: "text", text: text}
+    |> maybe_put_citations(metadata)
   end
 
   # A provider-native block decoded from an earlier Anthropic response
@@ -400,6 +405,12 @@ defmodule ReqLLM.Providers.Anthropic.Context do
 
   defp maybe_put_cache_control(block, _metadata), do: block
 
+  # Citations decoded from an earlier Anthropic text block go back with it.
+  defp maybe_put_citations(block, %{citations: [_ | _] = citations}),
+    do: Map.put(block, :citations, citations)
+
+  defp maybe_put_citations(block, _metadata), do: block
+
   defp maybe_put_signature(block, %{signature: signature}) when is_binary(signature),
     do: Map.put(block, :signature, signature)
 
@@ -475,8 +486,8 @@ defmodule ReqLLM.Providers.Anthropic.Context do
 
   # Accepts either key convention: thinking blocks are atom-keyed, but a block
   # replayed verbatim from a decoded response could arrive string-keyed.
-  defp thinking_block?(%{type: "thinking"}), do: true
-  defp thinking_block?(%{"type" => "thinking"}), do: true
+  defp thinking_block?(%{type: type}) when type in ["thinking", "redacted_thinking"], do: true
+  defp thinking_block?(%{"type" => type}) when type in ["thinking", "redacted_thinking"], do: true
   defp thinking_block?(_), do: false
 
   defp encode_reasoning_details(nil), do: []

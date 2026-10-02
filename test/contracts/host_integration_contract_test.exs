@@ -274,6 +274,9 @@ defmodule ReqLLM.HostIntegrationContractTest do
     }
   end
 
+  # A signed Anthropic thinking block also rides the content as a provider item,
+  # so it can be replayed in its original position. That replay copy is
+  # Anthropic-only and is not part of the cross-provider contract.
   defp host_response_projection(response) do
     classification = Response.classify(response)
     metadata = Response.call_metadata(response)
@@ -286,7 +289,11 @@ defmodule ReqLLM.HostIntegrationContractTest do
       finish_reason: classification.finish_reason,
       usage: canonical_usage(metadata.usage),
       warnings: Map.get(metadata, :warnings, []),
-      output_types: response |> Response.output_items() |> Enum.map(& &1.type)
+      output_types:
+        response
+        |> Response.output_items()
+        |> Enum.map(& &1.type)
+        |> Enum.reject(&(&1 == :provider_item))
     }
   end
 
